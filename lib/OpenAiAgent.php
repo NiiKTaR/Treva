@@ -187,7 +187,7 @@ class OpenAiAgent
             }
         }
 
-        // 3. Separator-stripped alphanumeric match (e.g. "lamp 1" == "Lamp1", "lampara 1" == "Lámpara1")
+        // 3. Separator-stripped alphanumeric match (e.g. "lampara 1" == "Lámpara1", "r312" == "R-312", "ri2" == "R-I_-2")
         $alnumNeedle = self::foldAlnum($needle);
         $lampAltAlnum = '';
         if (preg_match('/^(?:lamp|light|luz|bulb|foco|lamparita|lampara)\s*([0-9]+)$/', $needle, $lm)) {
@@ -205,17 +205,17 @@ class OpenAiAgent
         $aliasCategories = [];
         if (preg_match('/\b(air\s*cond|a\/c|ac|aire|clima|split|climatizador|calefactor|cooler)\b/', $needle)) {
             $aliasCategories[] = 'ir_ac';
-        } elseif (preg_match('/\b(speaker|speakers|parlante|parlantes|altavoz|altavoces|amplifier|amp|amplificador|soundbar|audio|stereo|musica)\b/', $needle)) {
+        } elseif (preg_match('/\b(speaker|speakers|parlante|parlantes|altavoz|altavoces|amplifier|amp|amplificador|edifier|soundbar|audio|stereo|musica)\b/', $needle)) {
             $aliasCategories[] = 'ir_audio';
         } elseif (preg_match('/\b(tv|television|tele|smart\s*tv|pantalla)\b/', $needle)) {
             $aliasCategories[] = 'ir_tv';
-        } elseif (preg_match('/\b(vacuum|robot|aspiradora|barredora|roomba)\b/', $needle)) {
+        } elseif (preg_match('/\b(vacuum|robot|aspiradora|barredora|roomba|sh7p|sh\s*7p)\b/', $needle)) {
             $aliasCategories[] = 'vacuum';
-        } elseif (preg_match('/\b(purifier|purificador|air\s*purifier)\b/', $needle)) {
+        } elseif (preg_match('/\b(purifier|purificador|air\s*purifier|r312)\b/', $needle)) {
             $aliasCategories[] = 'ir_purifier';
-        } elseif (preg_match('/\b(fan|fans|ventilador|ventiladores)\b/', $needle)) {
+        } elseif (preg_match('/\b(fan|fans|ventilador|ventiladores|sa7335|sa\s*7335|ri2)\b/', $needle)) {
             $aliasCategories[] = 'ir_fan';
-        } elseif (preg_match('/\b(ceiling|techo|magic\s*home|tira\s*led|led\s*strip)\b/', $needle)) {
+        } elseif (preg_match('/\b(ceiling|techo|cielo|magic\s*home|tira\s*led|led\s*strip)\b/', $needle)) {
             if (empty($preferredCategories) || in_array('light', $preferredCategories, true)) {
                 foreach ($allSmart as $dev) {
                     if (($dev['platform'] ?? '') === 'magichome') {
@@ -301,13 +301,13 @@ class OpenAiAgent
             ],
             [
                 'name' => 'control_smart_light',
-                'description' => 'Control any Wi-Fi smart light (Tuya lamps/bulbs, Magic Home strips) or ALL lights at once. Supports power on/off, brightness 1-100%, RGB/hex color, warm-to-cool white color temperature 0-100%, Magic Home effects, and auto-off countdown timers.',
+                'description' => 'Control any Wi-Fi smart light (Tuya lamps like Lampara1/2/3, Magic Home like Cielo) or ALL lights at once. Supports power on/off, brightness 1-100%, RGB/hex color, warm-to-cool white color temperature 0-100%, Magic Home effects, and auto-off countdown timers.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
                         'target' => [
                             'type' => 'string',
-                            'description' => 'Device name or ID (e.g. "Living Room Lamp", "Ceiling Strip"), or "all_lights" to control all Wi-Fi lights.'
+                            'description' => 'Device name or ID (e.g. "Lámpara1", "Cielo"), or "all_lights" to control all Wi-Fi lights.'
                         ],
                         'power' => ['type' => 'boolean', 'description' => 'Turn light on (true) or off (false).'],
                         'brightness' => ['type' => 'integer', 'description' => 'Brightness percentage from 1 to 100.'],
@@ -321,11 +321,11 @@ class OpenAiAgent
             ],
             [
                 'name' => 'control_robot_vacuum',
-                'description' => 'Send a movement or power command to a synced robot vacuum. ONLY use when explicitly asked to clean, pause, mop, dock, or power on/off; NEVER call this just to check battery or status (use list_smart_home_devices for status/battery).',
+                'description' => 'Send a movement or power command to the robot vacuum (e.g. Sh7p). ONLY use when explicitly asked to clean, pause, mop, dock, or power on/off; NEVER call this just to check battery or status (use list_smart_home_devices for status/battery).',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
-                        'target' => ['type' => 'string', 'description' => 'Vacuum device name or ID from synced devices (or "vacuum").'],
+                        'target' => ['type' => 'string', 'description' => 'Vacuum device name or ID (default "Sh7p").'],
                         'action' => [
                             'type' => 'string',
                             'enum' => ['start_clean', 'pause', 'dock', 'mop', 'smart_clean', 'power_on', 'power_off'],
@@ -337,14 +337,14 @@ class OpenAiAgent
             ],
             [
                 'name' => 'control_ir_device',
-                'description' => 'Control Smart Life IR remote virtual devices such as Air Conditioner, Speakers/Amplifier, TV, Fans, and Air Purifier. Sends PowerOff/PowerOn/Power, volume, channel, speed, or AC temperature/mode/fan.',
+                'description' => 'Control Smart Life IR remote virtual devices such as Air Conditioner (Aire), Edifier Speakers (Edifier), TV, Fans (SA7335, R-I_-2), and Air Purifier (R-312). Sends PowerOff/PowerOn/Power, volume, channel, speed, or AC temperature/mode/fan.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
-                        'target' => ['type' => 'string', 'description' => 'IR device name or ID from synced inventory (e.g. "AC", "Speakers", "TV", "Fan", "Air Purifier").'],
+                        'target' => ['type' => 'string', 'description' => 'IR device name or ID (e.g. "Aire", "Edifier", "TV", "SA7335", "R-312").'],
                         'power' => ['type' => 'boolean', 'description' => 'Power state true=on, false=off (maps to PowerOn/PowerOff or Power depending on device).'],
                         'command' => ['type' => 'string', 'description' => 'Specific IR button code from device spec, e.g. PowerOff, PowerOn, Power, Volume+, Volume-, Play, Pause, Next, Previous, Channel+, Channel-, Menu, Home, Speed, Swing, Auto, Sleep.'],
-                        'ac_temp' => ['type' => 'integer', 'description' => 'AC target temperature 16..30 C.'],
+                        'ac_temp' => ['type' => 'integer', 'description' => 'AC target temperature 16..30 C (only for Aire AC).'],
                         'ac_mode' => ['type' => 'string', 'enum' => ['cool', 'heat', 'auto', 'fan', 'dry'], 'description' => 'AC operating mode.'],
                         'ac_fan' => ['type' => 'string', 'enum' => ['auto', 'low', 'mid', 'high'], 'description' => 'AC fan speed.']
                     ],
@@ -353,13 +353,13 @@ class OpenAiAgent
             ],
             [
                 'name' => 'trigger_tuya_scene',
-                'description' => 'Run an existing Smart Life Tap-to-Run Smart Scene by scene_id, scene_name, or natural voice command/symbolic link (e.g. "Cool 18", "Dry Mode", "Power Off", or any scene voiceLink). Supports device_hint to disambiguate identically named scenes such as "Power".',
+                'description' => 'Run an existing Smart Life Tap-to-Run Smart Scene by scene_id, scene_name, or natural voice command/symbolic link (e.g. "Thunder18" / "air conditioner on 18", "Dry" / "dry mode", "Power Off", "Switch Parlante", "FIKA", or any scene voiceLink). Supports device_hint to disambiguate identically named scenes such as "Power".',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
                         'scene_id' => ['type' => 'string', 'description' => 'Exact Tuya scene_id from tapToRunScenes (preferred whenever known).'],
-                        'scene_name' => ['type' => 'string', 'description' => 'Exact scene name or associated voice command phrase (e.g. "Cool 18", "dry mode", "air conditioner 18", "Power Off").'],
-                        'device_hint' => ['type' => 'string', 'description' => 'Optional target device name (e.g. "AC", "TV", "Purifier", "Speakers") to disambiguate scenes.']
+                        'scene_name' => ['type' => 'string', 'description' => 'Exact scene name or associated voice command phrase (e.g. "Thunder18", "Dry", "dry mode", "air conditioner 18", "Power Off", "Switch Parlante").'],
+                        'device_hint' => ['type' => 'string', 'description' => 'Optional target device name (e.g. "Aire", "TV", "R-312", "Edifier") to disambiguate scenes.']
                     ]
                 ]
             ],
@@ -388,15 +388,35 @@ class OpenAiAgent
             ],
             [
                 'name' => 'control_google_cast',
-                'description' => 'Control Google Nest speakers, Google Home Mini, Google Cast Groups, or Chromecast displays — play/resume, pause, toggle play/pause, rewind, fast-forward, seek, next/previous track, stop active YouTube Music / YouTube / Cast media playback, close the running Cast app, adjust volume, mute/unmute, or sync live media status.',
+                'description' => 'Control Google Nest speakers (any variant: Nest Mini, Nest Audio, Nest Hub, Cast Groups like Knowhere) or Chromecast / Google TV displays (like Alice) — search the internet with gpt-6-luna and play any album, song, artist, playlist, video, or radio station directly on the device (action="play_web_media" with query, e.g. "latest Wiz Khalifa album"), play/resume, pause, toggle play/pause, rewind, fast-forward, seek, next/previous track, stop playback, quit app, adjust volume (set_volume, volume_up, volume_down, mute, unmute, toggle_mute), speak/announce a voice message out loud on the speaker/TV (action="announce" with text), play ambient relaxation sounds (action="play_preset" with preset), play a direct media URL (action="play_url" with url), launch an app (action="launch_app" with app="youtube"|"youtube_music"|"spotify"|"netflix"|"relaxing_sounds"|"backdrop"), or sync live Now Playing status.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
-                        'target' => ['type' => 'string', 'description' => 'Cast device name or ID from googleCast, "chromecast" / "nest", or "active" to auto-target whichever Cast device is currently playing or paused.'],
-                        'action' => ['type' => 'string', 'enum' => ['play', 'pause', 'toggle_play_pause', 'rewind', 'fast_forward', 'seek', 'restart', 'previous', 'next', 'stop_media', 'stop', 'set_volume', 'mute', 'unmute', 'sync_status']],
+                        'target' => ['type' => 'string', 'description' => 'Cast device name or ID (e.g. "Rabbit", "Alice", "Knowhere"), "nest" / "speaker", "chromecast" / "tv", "group" / "everywhere", or "active" to auto-target the currently playing/active device.'],
+                        'action' => [
+                            'type' => 'string',
+                            'enum' => [
+                                'play_web_media', 'play', 'pause', 'toggle_play_pause', 'rewind', 'fast_forward', 'seek', 'restart',
+                                'previous', 'next', 'stop_media', 'stop', 'set_volume', 'volume_up', 'volume_down',
+                                'mute', 'unmute', 'toggle_mute', 'sync_status', 'announce', 'play_preset', 'play_url', 'launch_app'
+                            ]
+                        ],
+                        'query' => ['type' => 'string', 'description' => 'Natural-language search query for any album, song, artist, playlist, video, or radio station on the internet when action="play_web_media" (e.g. "latest Wiz Khalifa album", "Wiz Khalifa Cool", "Daft Punk Random Access Memories", "Lo-Fi Hip Hop radio"). Resolved live via gpt-6-luna web search and played directly on the Chromecast or Google Nest device.'],
                         'seconds' => ['type' => 'number', 'description' => 'Seconds to rewind or fast_forward (defaults to 15 seconds if omitted).'],
                         'position_seconds' => ['type' => 'number', 'description' => 'Target playback position in seconds when action is seek.'],
-                        'volume_pct' => ['type' => 'integer', 'description' => 'Volume percentage 0..100 when action is set_volume.']
+                        'volume_pct' => ['type' => 'integer', 'description' => 'Volume percentage 0..100 when action is set_volume.'],
+                        'text' => ['type' => 'string', 'description' => 'Message text to speak out loud on the Google Nest or Chromecast when action="announce".'],
+                        'preset' => [
+                            'type' => 'string',
+                            'enum' => ['country_night', 'rain', 'ocean', 'thunderstorm', 'fireplace', 'forest', 'running_water', 'white_noise'],
+                            'description' => 'Ambient sound preset to play when action="play_preset".'
+                        ],
+                        'url' => ['type' => 'string', 'description' => 'Direct audio/video stream URL (http/https) when action="play_url".'],
+                        'title' => ['type' => 'string', 'description' => 'Optional media title when action="play_url".'],
+                        'app' => [
+                            'type' => 'string',
+                            'description' => 'App to open on Chromecast / Google TV / Nest Display when action="launch_app" (e.g. "youtube", "youtube_music", "spotify", "netflix", "relaxing_sounds", "backdrop").'
+                        ]
                     ],
                     'required' => ['action']
                 ]
@@ -647,11 +667,11 @@ Current live home inventory and Tap-to-Run scenes:
 {$snapJson}
 
 Smart Control Rules:
-1. Lights (devices in `lights`, or `all_lights`): use `control_smart_light`. Magic Home supports power, brightness, RGB hex color, color temperature approximation, and effect presets (37=fade, 38=red pulse, 41=strobe, 56=jump). Tuya lamps also support `color_temp_pct` (0=warm, 100=cool) and `countdown_seconds`.
-2. Robot Vacuum (`vacuumsAndSwitches`): use `control_robot_vacuum` (`start_clean`, `pause`, `dock`, `mop`, `power_off`, `power_on`).
-3. Infrared (IR) Remotes & Symbolic Scene Links (`irRemotes` and `tapToRunScenes`): EVERY Tap-to-Run scene in `tapToRunScenes` includes its decoded `config`, target `device`, and symbolic `voiceLinks`. Whenever the user gives a voice/text command matching a symbolically linked scene in `tapToRunScenes`, trigger it directly via `trigger_tuya_scene` with exact `scene_id` (or `scene_name` + `device_hint`). If the requested IR command has NO matching scene, try `control_ir_device` first; if Tuya Universal IR (`28841101`) is unsubscribed, explain honestly and offer the nearest available scenes from `tapToRunScenes` or ask the user to link/create the scene without silently picking the wrong temperature or mode. Never confuse ambiguous power toggles with a confirmed off state without mentioning it is a power toggle.
+1. Lights (`Lámpara1`, `Lámpara2`, `Lámpara3`, Magic Home `Cielo`, or `all_lights`): use `control_smart_light`. Magic Home supports power, brightness, RGB hex color, color temperature approximation, and effect presets (37=fade, 38=red pulse, 41=strobe, 56=jump). Tuya lamps also support `color_temp_pct` (0=warm, 100=cool) and `countdown_seconds`.
+2. Robot Vacuum (`Sh7p`): use `control_robot_vacuum` (`start_clean`, `pause`, `dock`, `mop`, `power_off`, `power_on`).
+3. Infrared (IR) Remotes & Symbolic Scene Links (`Aire` AC, `Edifier` speakers, `TV`, fans `SA7335` / `R-I_-2`, air purifier `R-312`): EVERY Tap-to-Run scene in `tapToRunScenes` includes its decoded `config`, target `device`, and symbolic `voiceLinks`. Whenever the user gives a voice/text command matching a symbolically linked scene — e.g. `"put the air conditioner on 18"` -> `Thunder18` (`M0_T18_S1_0`), `"put it on dry mode"` -> `Dry` (`M4_S1_0`), `"turn power mode on the air conditioner"` / `"jet mode"` / `"jetmode"` -> `"R-312":jetmode` (AC Jet / Power Mode on `Aire`, id `Ed6MOOQ1qnlQKdjj`, NOT the air purifier), `"fan mode"` -> `Ventilador`, `"heat"` -> `Incendio`, `"auto"` -> `Automatico`, `"turn off Aire"` -> `Power Off`, `"start FIKA"` -> `FIKA`, or any custom `voiceLinks` / `"Device":cmd` scene — trigger it directly via `trigger_tuya_scene` with exact `scene_id` (or `scene_name` + `device_hint`). If the requested IR command has NO matching scene (for example `24°C` / `Thunder24` if not synced yet, or fine volume/channel controls), try `control_ir_device` first; if Tuya Universal IR (`28841101`) is unsubscribed, explain honestly and offer the nearest available scenes (e.g. `Thunder22` / `Thunder26`) or ask the user to link/create the scene without silently picking the wrong temperature. Never confuse ambiguous toggles like `Switch Parlante` / `"Loudspeaker":power` with confirmed off state without mentioning it is a power toggle.
 4. Complex multi-device scenes ("movie night", "goodnight", "turn off everything"): call `batch_smart_actions` in a single request so every device changes smoothly.
-5. Google Cast speakers/displays (`googleCast`): use `control_google_cast` to `play` (resume), `pause`, `toggle_play_pause`, `rewind` (`seconds`, default 15), `fast_forward` (`seconds`), `seek` (`position_seconds`), `restart`, `previous`, `next`, `stop_media`, `stop` (exit app), `set_volume`, `mute`/`unmute`, or `sync_status` on active YouTube Music, YouTube, or other playing Cast sessions (use `target="active"` when the user doesn't specify a device name). Bluetooth BLE lights: use `control_ble_light`.{$delegationRule}
+5. Google Cast speakers/displays (`Alice` Chromecast, `Rabbit` Google Nest Mini, `Knowhere` Cast Group, or any Google Nest / Google TV variant): whenever the user asks to play any specific artist, album, song, music, video, or radio station from the internet (e.g. "Play latest Wiz Khalifa album", "Play Wiz Khalifa on Rabbit", "Play Daft Punk on Alice"), IMMEDIATELY call `control_google_cast` with `action="play_web_media"` and `query="<what the user asked to play>"` (do NOT delegate to `ask_smart_reasoner` first — `play_web_media` automatically runs `gpt-6-luna` live web search to find the URL/tracks and starts playing directly on the Chromecast or Google Nest!). Also use `control_google_cast` to `play` (resume), `pause`, `toggle_play_pause`, `rewind` (`seconds`, default 15), `fast_forward` (`seconds`), `seek` (`position_seconds`), `restart`, `previous`, `next`, `stop_media`, `stop` (exit app), `set_volume`, `volume_up`, `volume_down`, `mute`/`unmute`/`toggle_mute`, `announce` (speak a voice message `text` out loud on the speaker/TV), `play_preset` (`country_night`, `rain`, `ocean`, `thunderstorm`, `fireplace`, `forest`, `running_water`, `white_noise`), `play_url` (`url`), `launch_app` (`youtube`, `youtube_music`, `spotify`, `netflix`, `relaxing_sounds`, `backdrop`), or `sync_status` on active Cast sessions (use `target="active"` when the user doesn't specify a device name). Bluetooth BLE lights: use `control_ble_light`.{$delegationRule}
 PROMPT;
     }
 
@@ -745,7 +765,7 @@ PROMPT;
                 ];
 
             case 'control_robot_vacuum':
-                $target = trim((string)($args['target'] ?? 'vacuum')) ?: 'vacuum';
+                $target = trim((string)($args['target'] ?? 'Sh7p')) ?: 'Sh7p';
                 $dev = self::resolveSmartDevice($allSmart, $target, ['vacuum']);
                 if (!$dev) {
                     return [
@@ -889,6 +909,11 @@ PROMPT;
                 if (isset($args['position_seconds']) && is_numeric($args['position_seconds'])) {
                     $mediaOpts['position_seconds'] = (float)$args['position_seconds'];
                 }
+                foreach (['query', 'text', 'preset', 'url', 'title', 'app', 'voice'] as $optKey) {
+                    if (!empty($args[$optKey]) && is_string($args[$optKey])) {
+                        $mediaOpts[$optKey] = trim($args[$optKey]);
+                    }
+                }
                 $res = SmartController::controlCast($store, $target, $action, $vol, $muted, $mediaOpts);
                 if (!empty($res['clientSideRequired']) && empty($clientContext['castSdk'])) {
                     return [
@@ -896,6 +921,7 @@ PROMPT;
                         'error' => "No active media session found on Google Cast or Nest devices matching '{$target}'.",
                         'availableCastDevices' => array_values(array_map(static fn($c) => [
                             'name' => $c['name'] ?? '',
+                            'model' => $c['model'] ?? '',
                             'status' => $c['status'] ?? 'IDLE',
                             'appName' => $c['appName'] ?? null
                         ], $store->getDevices()))
@@ -1036,7 +1062,7 @@ PROMPT;
         return trim((string)($data['text'] ?? ''));
     }
 
-    public static function speakText(string $apiKey, string $text, string $voice = 'verse'): ?string
+    public static function speakTextBytes(string $apiKey, string $text, string $voice = 'verse'): ?string
     {
         if ($apiKey === '' || trim($text) === '') return null;
         if (!in_array($voice, self::ALLOWED_VOICES, true)) {
@@ -1067,6 +1093,13 @@ PROMPT;
         if ($raw === false || $code >= 400 || $raw === '') {
             return null;
         }
+        return $raw;
+    }
+
+    public static function speakText(string $apiKey, string $text, string $voice = 'verse'): ?string
+    {
+        $raw = self::speakTextBytes($apiKey, $text, $voice);
+        if ($raw === null) return null;
         return 'data:audio/mpeg;base64,' . base64_encode($raw);
     }
 

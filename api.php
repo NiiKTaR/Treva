@@ -18,12 +18,14 @@ require_once __DIR__ . '/lib/MagicHomeClient.php';
 require_once __DIR__ . '/lib/TuyaClient.php';
 require_once __DIR__ . '/lib/SmartController.php';
 require_once __DIR__ . '/lib/SceneLinker.php';
+require_once __DIR__ . '/lib/WebMediaResolver.php';
 require_once __DIR__ . '/lib/OpenAiAgent.php';
 
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+header('Access-Control-Allow-Headers: Content-Type, Access-Control-Request-Private-Network');
+header('Access-Control-Allow-Private-Network: true');
 header('Cache-Control: no-store, no-cache, must-revalidate');
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
@@ -32,9 +34,24 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
 }
 
 $action = $_GET['action'] ?? 'state';
+if ($action === 'cast_tts_audio') {
+    $file = basename((string)($_GET['file'] ?? ''));
+    $path = __DIR__ . DIRECTORY_SEPARATOR . 'data' . DIRECTORY_SEPARATOR . 'streams' . DIRECTORY_SEPARATOR . 'tts' . DIRECTORY_SEPARATOR . $file;
+    if (!preg_match('/^tts-[a-f0-9]{16,40}\.mp3$/', $file) || !is_file($path)) {
+        http_response_code(404);
+        echo json_encode(['error' => 'TTS audio file not found']);
+        exit;
+    }
+    header('Content-Type: audio/mpeg');
+    header('Content-Length: ' . (string)filesize($path));
+    header('Accept-Ranges: bytes');
+    readfile($path);
+    exit;
+}
+
 $sid = StreamStore::sanitizeId($_GET['sid'] ?? 'live');
 $store = new StreamStore();
-if (!in_array($action, ['push', 'stream_start', 'stream_stop', 'stream_heartbeat'], true)) {
+if (!in_array($action, ['push', 'stream_start', 'stream_stop', 'stream_heartbeat', 'cast_tts_audio'], true)) {
     $store->initSession(in_array($action, ['state', 'ai_session_instructions'], true));
 }
 
@@ -252,7 +269,7 @@ try {
         }
 
         $isLocal = NetworkHelper::isLocalEnvironment();
-        $devices = $isLocal ? array_values($store->getDevices()) : [];
+        $devices = $isLocal ? SmartController::syncAllCastDevices($store, 1.2, true, 6) : [];
         $endpoints = buildStreamUrls($sid, $selectedLanIp);
         $snap = buildSceneSnapshot($store);
 
@@ -504,7 +521,17 @@ try {
         if (isset($body['position_seconds']) && is_numeric($body['position_seconds'])) {
             $mediaOpts['position_seconds'] = (float)$body['position_seconds'];
         }
-        $res = SmartController::controlCast($store, $deviceId, $mediaAction, null, null, $mediaOpts);
+        if (isset($body['step']) && is_numeric($body['step'])) {
+            $mediaOpts['step'] = (float)$body['step'];
+        }
+        foreach (['query', 'text', 'preset', 'url', 'title', 'subtitle', 'content_type', 'app', 'voice', 'image_url'] as $optKey) {
+            if (!empty($body[$optKey]) && is_string($body[$optKey])) {
+                $mediaOpts[$optKey] = trim($body[$optKey]);
+            }
+        }
+        $vol = isset($body['volume']) && is_numeric($body['volume']) ? (float)$body['volume'] : null;
+        $muted = isset($body['muted']) ? (bool)$body['muted'] : null;
+        $res = SmartController::controlCast($store, $deviceId, $mediaAction, $vol, $muted, $mediaOpts);
         echo json_encode($res);
         exit;
     }

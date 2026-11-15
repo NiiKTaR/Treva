@@ -13,8 +13,18 @@
       window.location.replace('https://' + window.location.host + window.location.pathname + window.location.search + window.location.hash);
     }
   </script>
+  <meta name="theme-color" content="#081124" />
+  <meta name="application-name" content="Treva" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Treva" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/png" sizes="192x192" href="assets/icons/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="assets/icons/icon-512.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/icons/apple-touch-icon.png" />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(30 12 12)'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(-30 12 12)'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="assets/css/styles.css?v=6.6" />
+  <link rel="stylesheet" href="assets/css/styles.css?v=6.8" />
   <script type="importmap">
     {
       "imports": {
@@ -74,6 +84,14 @@
             <line x1="12" y1="18" x2="12.01" y2="18" />
           </svg>
           <span>Mobile / QR</span>
+        </button>
+
+        <button class="btn btn-secondary btn-sm" id="installAppBtn" type="button" title="Install or open Treva as a Chrome App">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="4" width="18" height="14" rx="2" />
+            <path d="M8 20h8M12 14V8m0 6l-2.5-2.5M12 14l2.5-2.5" />
+          </svg>
+          <span id="installAppBtnLabel">Chrome App</span>
         </button>
 
         <button class="btn btn-secondary btn-sm vos-expand-btn" id="openVosFullscreenBtn" type="button" title="Toggle Fullscreen (Optional)" aria-expanded="false" aria-controls="vosSection">
@@ -193,6 +211,7 @@
               <div class="vos-pure-actions">
                 <button type="button" class="vos-pill-btn" id="togglePureControlsBtn" title="Toggle Camera &amp; Layer Controls">Controls</button>
                 <button type="button" class="vos-pill-btn" id="togglePureVoiceBtn" title="Toggle Voice Agent Bar">Voice</button>
+                <button type="button" class="vos-pill-btn" id="vosPureAppBtn" title="Install or open Treva as a Chrome App">App</button>
                 <button type="button" class="vos-pill-btn" id="togglePureDrawerBtn" title="Open Devices, Scenes &amp; Telemetry Drawer">Menu</button>
               </div>
             </div>
@@ -279,10 +298,13 @@
           </form>
 
           <div class="ai-quick-chips" id="aiQuickChips">
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off the air conditioner">Turn off AC</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off the speakers">Turn off Speakers</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Set air conditioner to 22 degrees Cool mode">AC 22&deg;C Cool</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Send robot vacuum back to dock">Dock Vacuum</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Play latest Wiz Khalifa album">Play Latest Wiz Khalifa Album</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="What is currently playing on my Google Nest or Chromecast?">What&apos;s Playing?</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Pause or resume playback on Rabbit (Google Nest Mini)">Play / Pause Nest</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Play country night relaxation sounds on Rabbit">Country Night on Nest</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off Aire (air conditioner)">Turn off Aire</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Set Aire AC to 22 degrees Cool mode">Aire 22&deg;C Cool</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Send Sh7p robot vacuum back to dock">Dock Sh7p</button>
             <button type="button" class="chip-btn ai-chip-btn" data-prompt="Movie mode: warm dim all lights to 25% brightness">Movie Lights</button>
             <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off all lights in the house">All Lights Off</button>
           </div>
@@ -297,6 +319,7 @@
         <div class="vos-drawer-top">
           <span class="vos-drawer-brand">Treva Telemetry &amp; Config</span>
           <div class="vos-drawer-tools">
+            <button type="button" class="btn btn-secondary btn-xs" id="drawerAppBtn" title="Install or open Treva as a Chrome App">App</button>
             <button type="button" class="btn btn-secondary btn-xs" id="drawerKeysBtn" title="Smart Life &amp; OpenAI Keys">Keys</button>
             <button type="button" class="btn btn-secondary btn-xs" id="drawerQrBtn" title="Mobile QR">QR</button>
             <button type="button" class="btn btn-secondary btn-xs" id="drawerCloseBtn" title="Close Menu">&times;</button>
@@ -397,6 +420,19 @@
                   <button type="submit" class="btn btn-primary btn-sm">Save Magic Home</button>
                 </div>
               </form>
+
+              <div class="smart-cast-hub" id="smartCastHubSection">
+                <div class="smart-scenes-header" style="margin-bottom:8px;">
+                  <div>
+                    <strong>Google Nest, Chromecast &amp; Google TV</strong>
+                    <span class="empty-sub" id="smartCastHubMeta">Live Now Playing, Play/Pause, Voice Broadcast &amp; App Control</span>
+                  </div>
+                  <div class="smart-scenes-controls">
+                    <button type="button" class="btn btn-secondary btn-xs" id="smartTabScanCastBtn" title="Scan Wi-Fi for Google Nest, Chromecast &amp; Google TV">&#8635; Scan Cast</button>
+                  </div>
+                </div>
+                <div class="devices-list" id="smartCastHubList"></div>
+              </div>
 
               <div class="smart-devices-grid" id="smartDevicesGrid">
                 <div class="empty-devices">
@@ -712,6 +748,35 @@
         </div>
 
         <div class="key-section-box">
+          <h4>Google Nest (All Variants), Chromecast / Google TV &amp; Bluetooth</h4>
+          <p class="small muted" style="margin:0 0 8px 0;">
+            <strong>Zero-Key Local Cast V2 API (Active by default):</strong> Automatically discovers and controls Google Nest Mini / Audio / Hub, Cast Speaker Groups, Chromecast, and Google TV over your Wi-Fi LAN (Play, Pause, Seek, Volume, Now Playing, Voice Broadcast TTS, Relaxation Sounds &amp; App Launch) with <strong>no API key required</strong>. You can also pair any Google Nest or TV via <strong>Bluetooth Audio</strong> and select it as your speaker output.
+          </p>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px;">
+            <span id="nestCastModalStatusPill" class="pill pill-live" style="font-size:0.72rem;">Cast V2 LAN Active</span>
+            <button type="button" id="modalScanCastBtn" class="btn btn-ghost btn-xs">Scan Nest &amp; Chromecast (mDNS)</button>
+            <button type="button" id="modalSelectBtBtn" class="btn btn-ghost btn-xs">Select Bluetooth Speaker Output</button>
+          </div>
+          <details style="margin-top:6px;">
+            <summary class="small muted" style="cursor:pointer; user-select:none;">Optional: Google Home Device Access (SDM Cloud API Keys for Nest Thermostats / Cameras)</summary>
+            <div class="smart-keys-grid" style="margin-top:8px;">
+              <label>SDM Project ID
+                <input type="text" id="googleNestProjectIdInput" placeholder="Optional SDM Enterprise Project ID">
+              </label>
+              <label>OAuth Client ID
+                <input type="text" id="googleNestClientIdInput" placeholder="Optional Google Cloud OAuth Client ID">
+              </label>
+              <label>OAuth Client Secret
+                <input type="password" id="googleNestClientSecretInput" placeholder="Leave blank to keep stored secret">
+              </label>
+              <label>OAuth Refresh Token
+                <input type="password" id="googleNestRefreshTokenInput" placeholder="Leave blank to keep stored refresh token">
+              </label>
+            </div>
+          </details>
+        </div>
+
+        <div class="key-section-box">
           <h4>OpenAI Voice Agent (Server Fallback + Local Cache)</h4>
           <p>Uses the server&apos;s configured OpenAI key as fallback when available, or enter your own OpenAI key below to override strictly inside your local session cache.</p>
           <div class="form-grid-2">
@@ -767,11 +832,39 @@
     </div>
   </div>
 
+  <!-- Chrome App / PWA Modal -->
+  <div class="modal-backdrop hidden" id="appInstallModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Treva Chrome App</h3>
+        <button type="button" class="icon-close-btn" id="closeAppInstallModalBtn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="pwa-modal-box">
+          <div class="pwa-modal-head">
+            <span class="pwa-status-badge" id="appInstallStatusBadge">Checking...</span>
+          </div>
+          <p class="pwa-status-text" id="appInstallStatusText"></p>
+          <ul class="pwa-steps-list" id="appModalChromeSteps"></ul>
+          <code class="pwa-url-code" id="appModalUrlCode">...</code>
+          <div class="pwa-modal-actions">
+            <button type="button" class="btn btn-primary btn-sm hidden" id="appModalPrimaryActionBtn">Install Chrome App Now</button>
+            <button type="button" class="btn btn-primary btn-sm hidden" id="appModalSwitchOriginBtn">Open on Localhost</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="appModalCopyUrlBtn">Copy App URL</button>
+            <button type="button" class="btn btn-secondary btn-sm hidden" id="appModalOpenTabBtn">Open in Browser Tab</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast Container -->
   <div class="toast-container" id="toastContainer"></div>
 
   <script src="assets/js/qrcode.js"></script>
-  <script type="module" src="assets/js/vos-3d.js?v=6.6"></script>
-  <script defer src="assets/js/app.js?v=6.6"></script>
+  <script type="module" src="assets/js/vos-3d.js?v=6.8"></script>
+  <script defer src="assets/js/app.js?v=6.8"></script>
+  <script defer src="assets/js/pwa.js?v=6.8"></script>
 </body>
 </html>

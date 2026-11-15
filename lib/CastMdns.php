@@ -151,21 +151,54 @@ class CastMdns
             $model = $txt['md'] ?? 'Google Cast Device';
             $capabilities = (int)($txt['ca'] ?? 0);
             $kind = self::classifyDevice($model, $capabilities);
+            $variant = self::classifyVariant($model, $capabilities);
+            $mdnsStatusText = trim((string)($txt['rs'] ?? ''));
 
             $services[$id] = [
                 'id' => $id,
                 'name' => $friendlyName,
                 'model' => $model,
+                'variant' => $variant,
                 'host' => $hostIp,
                 'port' => (int)$srv['port'],
                 'capabilities' => $capabilities,
                 'kind' => $kind,
                 'supportsVideo' => $kind === 'display',
                 'supportsAudio' => true,
+                'mdnsStatusText' => $mdnsStatusText !== '' ? $mdnsStatusText : null,
                 'online' => true,
                 'isManual' => false
             ];
         }
+    }
+
+    public static function classifyVariant(string $model, int $capabilities = 0): string
+    {
+        $lower = strtolower($model);
+        if (str_contains($lower, 'group')) {
+            return 'cast_group';
+        }
+        if (str_contains($lower, 'hub') || str_contains($lower, 'display')) {
+            return 'nest_hub';
+        }
+        if (
+            str_contains($lower, 'google tv') ||
+            str_contains($lower, 'android tv') ||
+            str_contains($lower, 'shield') ||
+            str_contains($lower, 'bravia')
+        ) {
+            return 'google_tv';
+        }
+        if (
+            str_contains($lower, 'mini') ||
+            str_contains($lower, 'nest audio') ||
+            str_contains($lower, 'google home') ||
+            str_contains($lower, 'chromecast audio') ||
+            str_contains($lower, 'speaker')
+        ) {
+            return 'nest_speaker';
+        }
+        return (($capabilities & 1) === 1 || str_contains($lower, 'chromecast')) ? 'chromecast' : 'nest_speaker';
     }
 
     public static function classifyDevice(string $model, int $capabilities = 0): string

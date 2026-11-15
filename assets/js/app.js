@@ -329,6 +329,10 @@
   const smartManualVersion = document.getElementById('smartManualVersion');
   const smartManualCategory = document.getElementById('smartManualCategory');
   const smartDevicesGrid = document.getElementById('smartDevicesGrid');
+  const smartCastHubSection = document.getElementById('smartCastHubSection');
+  const smartCastHubMeta = document.getElementById('smartCastHubMeta');
+  const smartTabScanCastBtn = document.getElementById('smartTabScanCastBtn');
+  const smartCastHubList = document.getElementById('smartCastHubList');
 
   // Smart Keys Modal
   const smartKeysModal = document.getElementById('smartKeysModal');
@@ -349,6 +353,13 @@
   const mhTokenInput = document.getElementById('mhTokenInput');
   const mhTokenSavedTag = document.getElementById('mhTokenSavedTag');
   const mhRegionSelect = document.getElementById('mhRegionSelect');
+  const nestCastModalStatusPill = document.getElementById('nestCastModalStatusPill');
+  const modalScanCastBtn = document.getElementById('modalScanCastBtn');
+  const modalSelectBtBtn = document.getElementById('modalSelectBtBtn');
+  const googleNestProjectIdInput = document.getElementById('googleNestProjectIdInput');
+  const googleNestClientIdInput = document.getElementById('googleNestClientIdInput');
+  const googleNestClientSecretInput = document.getElementById('googleNestClientSecretInput');
+  const googleNestRefreshTokenInput = document.getElementById('googleNestRefreshTokenInput');
   const openAiKeyInput = document.getElementById('openAiKeyInput');
   const openAiKeySavedTag = document.getElementById('openAiKeySavedTag');
   const openAiVoiceModalSelect = document.getElementById('openAiVoiceModalSelect');
@@ -413,8 +424,69 @@
   const qrHelpText = document.getElementById('qrHelpText');
   const toastContainer = document.getElementById('toastContainer');
 
+  const LAN_BRIDGE_STORAGE_KEY = 'treva_lan_bridge_url_v1';
+  let localLanBridgeBase = '';
+  const LAN_BRIDGE_ACTIONS = new Set([
+    'discover',
+    'manual_device',
+    'remove_device',
+    'cast_start',
+    'cast_stop',
+    'cast_volume',
+    'cast_sync',
+    'cast_sync_all',
+    'cast_media',
+    'smart_scan_wifi',
+    'set_lan_ip',
+    'agent_chat',
+    'realtime_tool'
+  ]);
+
+  function normalizeBridgeBase(raw) {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) return '';
+    let url = trimmed.replace(/\/+(?:index\.php|api\.php)?$/i, '');
+    if (!/^https?:\/\//i.test(url)) {
+      url = 'http://' + url;
+    }
+    if (!/\/treva$/i.test(url)) {
+      url += '/Treva';
+    }
+    return url + '/';
+  }
+
+  async function probeLocalLanBridge() {
+    const candidates = [];
+    try {
+      const saved = window.localStorage ? window.localStorage.getItem(LAN_BRIDGE_STORAGE_KEY) : '';
+      if (saved) candidates.push(normalizeBridgeBase(saved));
+    } catch (_) {}
+    candidates.push('http://localhost/Treva/', 'http://127.0.0.1/Treva/');
+
+    const unique = Array.from(new Set(candidates.filter(Boolean)));
+    for (const base of unique) {
+      try {
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), 1800) : null;
+        const res = await fetch(`${base}api.php?action=info&sid=${encodeURIComponent(STREAM_SID)}`, {
+          cache: 'no-store',
+          signal: ctrl ? ctrl.signal : undefined
+        });
+        if (timer) clearTimeout(timer);
+        if (!res.ok) continue;
+        const info = await res.json();
+        if (info && info.isLocalEnvironment) {
+          localLanBridgeBase = base;
+          return info;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
   function apiUrl(action, extra = '') {
-    return `api.php?action=${encodeURIComponent(action)}&sid=${encodeURIComponent(STREAM_SID)}${extra}`;
+    const base = (localLanBridgeBase && LAN_BRIDGE_ACTIONS.has(action)) ? localLanBridgeBase : '';
+    return `${base}api.php?action=${encodeURIComponent(action)}&sid=${encodeURIComponent(STREAM_SID)}${extra}`;
   }
 
   function showToast(message, type = 'info') {
@@ -529,10 +601,25 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Server error');
 
+      if (!data.isLocalEnvironment) {
+        const bridgeInfo = await probeLocalLanBridge();
+        if (bridgeInfo) {
+          data.isLocalEnvironment = true;
+          data.isLocalBridge = true;
+          data.interfaces = bridgeInfo.interfaces || [];
+          data.selectedLanIp = bridgeInfo.selectedLanIp || '';
+          if (Array.isArray(bridgeInfo.devices) && bridgeInfo.devices.length > 0) {
+            data.devices = bridgeInfo.devices;
+          }
+        }
+      }
+
       serverInfo = data;
       serverDot.classList.add('online');
       if (vosPureDot) vosPureDot.classList.remove('offline');
-      serverStatusText.textContent = data.isLocalEnvironment ? 'PHP Local LAN Ready' : 'PHP Hosting Ready';
+      serverStatusText.textContent = data.isLocalBridge
+        ? 'PHP Hosting + Local Cast Bridge'
+        : (data.isLocalEnvironment ? 'PHP Local LAN Ready' : 'PHP Hosting Ready');
 
       if (data.isLocalEnvironment && Array.isArray(data.interfaces) && data.interfaces.length > 0) {
         lanAdapterGroup.classList.remove('hidden');
@@ -578,6 +665,9 @@
           const restored = await hydrateServerSession(localVault, true);
           if (restored && restored.ok) {
             activePayload = { ...data, ...restored };
+            if (data.isLocalBridge && Array.isArray(data.devices) && data.devices.length > 0) {
+              activePayload.devices = data.devices;
+            }
           }
         }
       }
@@ -602,8 +692,13 @@
       }
 
       if (data.isLocalEnvironment) {
+        localScanControls.classList.remove('hidden');
+        scanSmartWifiBtn.classList.remove('hidden');
         devices = activePayload.devices || [];
         renderDevices(true);
+        if (!devices || devices.length === 0) {
+          discoverLocalDevices(true);
+        }
       } else {
         localScanControls.classList.add('hidden');
         scanSmartWifiBtn.classList.add('hidden');
@@ -693,7 +788,7 @@
         if (Date.now() < interactionLockUntil) return;
 
         let changed = false;
-        if (serverInfo && serverInfo.isLocalEnvironment && Array.isArray(data.devices)) {
+        if (serverInfo && serverInfo.isLocalEnvironment && !serverInfo.isLocalBridge && Array.isArray(data.devices)) {
           devices = data.devices;
           renderDevices(false);
           changed = true;
@@ -1539,127 +1634,234 @@
   // LOCAL WIFI GOOGLE NEST / CAST LIST (Diffed Rendering)
   // ===========================================================================
   function renderRemoteHostingNotice() {
-    devicesList.innerHTML = `
+    const savedBridge = (window.localStorage && window.localStorage.getItem(LAN_BRIDGE_STORAGE_KEY)) || 'http://localhost/Treva';
+    const html = `
       <div class="empty-devices">
-        <p><strong>Running on Remote Hosting Server</strong></p>
-        <span class="empty-sub">Click the blue <strong>Cast to Nest / TV</strong> button above to discover and stream directly to any Google Nest Speaker, Nest Hub, or Chromecast on your local Wi-Fi.</span>
+        <p><strong>Remote Hosting Mode (No Local LAN Bridge Detected)</strong></p>
+        <span class="empty-sub">Google Nest &amp; Chromecast only listen on your local home Wi-Fi (port 8009 / mDNS). Start XAMPP locally (<code>http://localhost/Treva</code>) or enter your PC's LAN bridge URL below to list and control them from this hosted page:</span>
+        <div class="cast-cmd-row" style="margin-top:10px;max-width:420px;margin-left:auto;margin-right:auto;">
+          <input type="text" class="lan-bridge-input" value="${escapeHtml(savedBridge)}" placeholder="http://localhost/Treva or http://192.168.100.24/Treva" />
+          <button type="button" class="btn btn-primary btn-xs lan-bridge-connect-btn">Connect LAN Bridge</button>
+        </div>
+      </div>
+    `;
+    [devicesList, nestCastDevicesList].forEach((container) => {
+      if (!container) return;
+      container.innerHTML = html;
+      const btn = container.querySelector('.lan-bridge-connect-btn');
+      const inp = container.querySelector('.lan-bridge-input');
+      if (btn && inp) {
+        btn.addEventListener('click', async () => {
+          const val = inp.value.trim();
+          if (!val) return;
+          try {
+            if (window.localStorage) window.localStorage.setItem(LAN_BRIDGE_STORAGE_KEY, val);
+          } catch (_) {}
+          showToast('Probing local LAN Cast bridge...', 'info');
+          await loadServerInfo();
+          if (localLanBridgeBase) {
+            showToast('Connected to Local LAN Cast Bridge (' + localLanBridgeBase + ')', 'success');
+          } else {
+            showToast('Could not reach local XAMPP bridge at ' + val + '. Make sure Apache is running.', 'error');
+          }
+        });
+      }
+    });
+  }
+
+  const expandedCastCmdDevs = new Set();
+
+  function updateSmartAndCastCounters() {
+    const wifiLen = Array.isArray(smartDevices) ? smartDevices.length : 0;
+    const bleLen = Array.isArray(bleDevices) ? bleDevices.length : 0;
+    const castLen = Array.isArray(devices) ? devices.length : 0;
+    if (dockSmartCount) {
+      dockSmartCount.textContent = String(wifiLen + bleLen + castLen);
+    }
+    if (smartCastHubMeta) {
+      if (castLen === 0) {
+        smartCastHubMeta.textContent = 'Zero-Key LAN Ready';
+      } else {
+        const activeCount = (devices || []).filter((d) =>
+          ['PLAYING', 'BUFFERING', 'PAUSED', 'ACTIVE'].includes(String(d.status || '').toUpperCase())
+        ).length;
+        smartCastHubMeta.textContent = activeCount > 0
+          ? `${castLen} device(s) • ${activeCount} active`
+          : `${castLen} device(s) online`;
+      }
+    }
+    if (nestCastModalStatusPill) {
+      nestCastModalStatusPill.textContent = castLen > 0
+        ? `Cast V2 LAN Active • ${castLen} device(s)`
+        : 'Cast V2 LAN Ready';
+    }
+  }
+
+  function renderCastCommandDrawer(dev) {
+    const id = escapeHtml(dev.id);
+    const isExpanded = expandedCastCmdDevs.has(dev.id);
+    const isDisplay = dev.kind === 'display' || /chromecast|tv|hub/i.test(String(dev.model || dev.variant || ''));
+    return `
+      <div class="cast-cmd-drawer ${isExpanded ? '' : 'hidden'}" data-cmd-drawer="${id}">
+        <div class="cast-cmd-row">
+          <input type="text" class="cast-web-query-input" data-id="${id}" placeholder="Ask gpt-6-luna to find &amp; play (e.g. Latest Wiz Khalifa album)..." />
+          <button type="button" class="btn btn-primary btn-xs cast-web-query-btn" data-id="${id}">Find &amp; Play</button>
+        </div>
+        <div class="cast-cmd-row">
+          <input type="text" class="cast-tts-input" data-id="${id}" placeholder="Speak / announce on ${escapeHtml(dev.name)}..." />
+          <button type="button" class="btn btn-secondary btn-xs cast-tts-send-btn" data-id="${id}">Speak</button>
+        </div>
+        <div class="cast-cmd-group">
+          <span class="cast-cmd-label">Relaxing Sounds (1-Click):</span>
+          <div class="cast-preset-chips">
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="country_night">Country Night</button>
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="rain">Rain</button>
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="ocean">Ocean</button>
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="thunderstorm">Thunder</button>
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="fireplace">Fireplace</button>
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="forest">Forest</button>
+            <button type="button" class="cast-preset-chip" data-id="${id}" data-preset="white_noise">White Noise</button>
+          </div>
+        </div>
+        <div class="cast-cmd-group">
+          <span class="cast-cmd-label">${isDisplay ? 'Launch TV / Hub App:' : 'Launch Cast App:'}</span>
+          <div class="cast-preset-chips">
+            <button type="button" class="cast-app-chip" data-id="${id}" data-app="youtube">YouTube</button>
+            <button type="button" class="cast-app-chip" data-id="${id}" data-app="youtube_music">YT Music</button>
+            <button type="button" class="cast-app-chip" data-id="${id}" data-app="spotify">Spotify</button>
+            ${isDisplay ? `<button type="button" class="cast-app-chip" data-id="${id}" data-app="netflix">Netflix</button>` : ''}
+            <button type="button" class="cast-app-chip" data-id="${id}" data-app="backdrop">Idle / Backdrop</button>
+          </div>
+        </div>
+        <div class="cast-cmd-row">
+          <input type="url" class="cast-url-input" data-id="${id}" placeholder="Direct MP3 / AAC / MP4 / HLS stream URL..." />
+          <button type="button" class="btn btn-secondary btn-xs cast-url-send-btn" data-id="${id}">Play URL</button>
+        </div>
       </div>
     `;
   }
 
-  function renderDevices(force = false) {
-    if (serverInfo && !serverInfo.isLocalEnvironment) {
-      renderRemoteHostingNotice();
-      return;
-    }
+  function bindCastContainerEvents(container) {
+    if (!container) return;
 
-    const sig = JSON.stringify(
-      (devices || []).map((d) => [
-        d.id, d.name, d.host, d.port, d.kind, d.status, d.volume, d.muted, d.appName || '',
-        d.media ? [d.media.mediaSessionId, d.media.playerState, d.media.title, d.media.artist, Math.round((d.media.currentTime || 0) / 4)] : null
-      ])
-    );
-    if (!force && sig === lastDevicesSig) return;
-    lastDevicesSig = sig;
-
-    if (!devices || devices.length === 0) {
-      devicesList.innerHTML = `
-        <div class="empty-devices">
-          <p>No Google Nest or Chromecast devices discovered yet.</p>
-          <span class="empty-sub">Click <strong>Scan Wi-Fi</strong> above, use <strong>+ Add IP</strong>, or use the <strong>Cast to Nest / TV</strong> Chrome button above.</span>
-        </div>
-      `;
-      return;
-    }
-
-    devicesList.innerHTML = '';
-    devices.forEach((dev) => {
-      const castStatus = String(dev.status || 'IDLE').toUpperCase();
-      const isCasting = ['PLAYING', 'BUFFERING', 'PAUSED', 'ACTIVE'].includes(castStatus);
-      const media = dev.media && dev.media.mediaSessionId ? dev.media : null;
-      const card = document.createElement('div');
-      card.className = `device-card ${isCasting ? 'casting' : ''}`;
-
-      const kindLabel =
-        dev.kind === 'speaker' ? 'Nest Speaker (Audio MP3)' : 'Cast Display (Video + Audio)';
-
-      const iconSvg =
-        dev.kind === 'speaker'
-          ? `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-               <rect x="4" y="2" width="16" height="20" rx="4" ry="4" />
-               <circle cx="12" cy="14" r="4" />
-               <line x1="12" y1="6" x2="12.01" y2="6" />
-             </svg>`
-          : `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-               <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-               <line x1="8" y1="21" x2="16" y2="21" />
-               <line x1="12" y1="17" x2="12" y2="21" />
-             </svg>`;
-
-      const volPercent = Math.round((dev.volume !== undefined ? dev.volume : 0.7) * 100);
-
-      card.innerHTML = `
-        <div class="device-top">
-          <div class="device-info">
-            <div class="device-icon">${iconSvg}</div>
-            <div>
-              <div class="device-name">${escapeHtml(dev.name)}</div>
-              <div class="device-meta">
-                <span class="device-kind-tag">${kindLabel}</span>
-                <span>${escapeHtml(dev.host)}:${dev.port}</span>
-                <span>&bull; <strong>${escapeHtml(dev.status || 'IDLE')}</strong></span>
-              </div>
-            </div>
-          </div>
-
-          <div class="device-actions">
-            ${
-              isCasting
-                ? `<button type="button" class="btn btn-secondary btn-sm cast-sync-btn" data-id="${escapeHtml(dev.id)}" title="Refresh status & volume">Sync</button>
-                   <button type="button" class="btn btn-danger btn-sm cast-stop-btn" data-id="${escapeHtml(dev.id)}">Stop</button>`
-                : `<button type="button" class="btn btn-primary btn-sm cast-start-btn" data-id="${escapeHtml(dev.id)}">Cast Now</button>`
-            }
-            ${
-              dev.isManual
-                ? `<button type="button" class="btn btn-secondary btn-sm remove-dev-btn" data-id="${escapeHtml(dev.id)}" title="Remove manual device">&times;</button>`
-                : ''
-            }
-          </div>
-        </div>
-
-        <div class="device-volume-row">
-          <button type="button" class="mute-btn" data-id="${escapeHtml(dev.id)}" data-muted="${Boolean(dev.muted)}" title="Toggle Mute">
-            ${
-              dev.muted
-                ? `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`
-                : `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`
-            }
-          </button>
-          <input type="range" class="volume-slider" min="0" max="100" value="${volPercent}" data-id="${escapeHtml(dev.id)}" />
-          <span class="volume-pct">${dev.muted ? 'Muted' : `${volPercent}%`}</span>
-        </div>
-        ${renderCastMediaBlock(dev, media)}
-      `;
-
-      devicesList.appendChild(card);
-    });
-
-    devicesList.querySelectorAll('.cast-start-btn').forEach((btn) => {
+    container.querySelectorAll('.cast-start-btn').forEach((btn) => {
       btn.addEventListener('click', () => handleLocalCastStart(btn.dataset.id));
     });
 
-    devicesList.querySelectorAll('.cast-media-btn').forEach((btn) => {
+    container.querySelectorAll('.cast-cmd-toggle-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.id;
+        if (expandedCastCmdDevs.has(id)) {
+          expandedCastCmdDevs.delete(id);
+        } else {
+          expandedCastCmdDevs.add(id);
+        }
+        document.querySelectorAll(`[data-cmd-drawer="${CSS.escape(id)}"]`).forEach((el) => {
+          el.classList.toggle('hidden', !expandedCastCmdDevs.has(id));
+        });
+        document.querySelectorAll(`.cast-cmd-toggle-btn[data-id="${CSS.escape(id)}"]`).forEach((b) => {
+          b.textContent = expandedCastCmdDevs.has(id) ? 'Commands ▴' : 'Commands ▾';
+        });
+      });
+    });
+
+    container.querySelectorAll('.cast-media-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         lockDomRefresh(1800);
         handleCastMediaAction(btn.dataset.id, btn.dataset.action, btn.dataset.seconds ? Number(btn.dataset.seconds) : null);
       });
     });
 
-    devicesList.querySelectorAll('.cast-stop-btn').forEach((btn) => {
+    container.querySelectorAll('.cast-media-bar[data-seek-id]').forEach((bar) => {
+      bar.addEventListener('click', (e) => {
+        const dur = Number(bar.dataset.dur) || 0;
+        if (dur <= 0) return;
+        const rect = bar.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / (rect.width || 1)));
+        const targetSec = Math.round(ratio * dur);
+        lockDomRefresh(1800);
+        handleCastMediaAction(bar.dataset.seekId, 'seek', null, { position_seconds: targetSec });
+      });
+    });
+
+    container.querySelectorAll('.cast-web-query-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.id;
+        const inp = btn.parentElement.querySelector('.cast-web-query-input');
+        const query = inp ? inp.value.trim() : '';
+        if (!query) {
+          showToast('Type an album, song, artist, or video to search & play (e.g. "latest Wiz Khalifa album").', 'info');
+          return;
+        }
+        if (inp) inp.value = '';
+        handleCastMediaAction(id, 'play_web_media', null, { query });
+      });
+    });
+
+    container.querySelectorAll('.cast-web-query-input').forEach((inp) => {
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const btn = inp.parentElement.querySelector('.cast-web-query-btn');
+          if (btn) btn.click();
+        }
+      });
+    });
+
+    container.querySelectorAll('.cast-tts-send-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.id;
+        const inp = btn.parentElement.querySelector('.cast-tts-input');
+        const text = inp ? inp.value.trim() : '';
+        if (!text) {
+          showToast('Type a message to speak on this device first.', 'info');
+          return;
+        }
+        if (inp) inp.value = '';
+        handleCastMediaAction(id, 'announce', null, { text });
+      });
+    });
+
+    container.querySelectorAll('.cast-tts-input').forEach((inp) => {
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const btn = inp.parentElement.querySelector('.cast-tts-send-btn');
+          if (btn) btn.click();
+        }
+      });
+    });
+
+    container.querySelectorAll('.cast-preset-chip').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        handleCastMediaAction(btn.dataset.id, 'play_preset', null, { preset: btn.dataset.preset });
+      });
+    });
+
+    container.querySelectorAll('.cast-app-chip').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        handleCastMediaAction(btn.dataset.id, 'launch_app', null, { app: btn.dataset.app });
+      });
+    });
+
+    container.querySelectorAll('.cast-url-send-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.id;
+        const inp = btn.parentElement.querySelector('.cast-url-input');
+        const url = inp ? inp.value.trim() : '';
+        if (!url) {
+          showToast('Paste an audio/video stream URL first.', 'info');
+          return;
+        }
+        handleCastMediaAction(id, 'play_url', null, { url });
+      });
+    });
+
+    container.querySelectorAll('.cast-stop-btn').forEach((btn) => {
       btn.addEventListener('click', () => handleLocalCastStop(btn.dataset.id));
     });
 
-    devicesList.querySelectorAll('.cast-sync-btn').forEach((btn) => {
+    container.querySelectorAll('.cast-sync-btn').forEach((btn) => {
       btn.addEventListener('click', async () => {
         try {
           const res = await fetch(apiUrl('cast_sync'), {
@@ -1672,6 +1874,7 @@
             const idx = devices.findIndex((d) => d.id === data.device.id);
             if (idx !== -1) devices[idx] = data.device;
             renderDevices(true);
+            syncVosState();
             showToast(`Synced ${data.device.name}`);
           }
         } catch (err) {
@@ -1680,7 +1883,7 @@
       });
     });
 
-    devicesList.querySelectorAll('.remove-dev-btn').forEach((btn) => {
+    container.querySelectorAll('.remove-dev-btn').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const res = await fetch(apiUrl('remove_device'), {
           method: 'POST',
@@ -1697,7 +1900,7 @@
       });
     });
 
-    devicesList.querySelectorAll('.volume-slider').forEach((slider) => {
+    container.querySelectorAll('.volume-slider').forEach((slider) => {
       const pctLabel = slider.parentElement.querySelector('.volume-pct');
       slider.addEventListener('input', () => {
         lockDomRefresh(3000);
@@ -1716,6 +1919,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ deviceId: slider.dataset.id, level, muted: false })
         }).catch(() => {});
+        renderDevices(true);
         if (window.TrevaVos) {
           if (typeof window.TrevaVos.recordSystemUsage === 'function') {
             window.TrevaVos.recordSystemUsage('cast', `${dev ? dev.name : 'Cast'} vol ${slider.value}%`, { boost: 0.24 });
@@ -1725,7 +1929,7 @@
       });
     });
 
-    devicesList.querySelectorAll('.mute-btn').forEach((btn) => {
+    container.querySelectorAll('.mute-btn').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const currentlyMuted = btn.dataset.muted === 'true';
         const res = await fetch(apiUrl('cast_volume'), {
@@ -1755,6 +1959,118 @@
     });
   }
 
+  function renderDevices(force = false) {
+    updateSmartAndCastCounters();
+    if (serverInfo && !serverInfo.isLocalEnvironment) {
+      renderRemoteHostingNotice();
+      return;
+    }
+
+    const sig = JSON.stringify(
+      (devices || []).map((d) => [
+        d.id, d.name, d.host, d.port, d.kind, d.model || '', d.status, d.volume, d.muted, d.appName || '',
+        d.media ? [d.media.mediaSessionId, d.media.playerState, d.media.title, d.media.artist, Math.round((d.media.currentTime || 0) / 4)] : null
+      ])
+    );
+    if (!force && sig === lastDevicesSig) return;
+    lastDevicesSig = sig;
+
+    const targetContainers = [devicesList, smartCastHubList].filter(Boolean);
+
+    if (!devices || devices.length === 0) {
+      const emptyHtml = `
+        <div class="empty-devices">
+          <p>No Google Nest or Chromecast devices discovered yet.</p>
+          <span class="empty-sub">Click <strong>Scan Nest / Cast</strong> or <strong>Scan Wi-Fi</strong> above, use <strong>+ Add IP</strong>, or use <strong>Select Bluetooth Speaker Output</strong>.</span>
+        </div>
+      `;
+      targetContainers.forEach((c) => {
+        c.innerHTML = emptyHtml;
+      });
+      return;
+    }
+
+    targetContainers.forEach((container) => {
+      container.innerHTML = '';
+      devices.forEach((dev) => {
+        const castStatus = String(dev.status || 'IDLE').toUpperCase();
+        const isCasting = ['PLAYING', 'BUFFERING', 'PAUSED', 'ACTIVE'].includes(castStatus);
+        const media = dev.media && (dev.media.mediaSessionId !== undefined || dev.media.title) ? dev.media : null;
+        const card = document.createElement('div');
+        card.className = `device-card ${isCasting ? 'casting' : ''}`;
+
+        const kindLabel = dev.model
+          ? dev.model
+          : (dev.kind === 'speaker' ? 'Google Nest Speaker' : 'Chromecast / Google TV');
+
+        const iconSvg =
+          dev.kind === 'speaker'
+            ? `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                 <rect x="4" y="2" width="16" height="20" rx="4" ry="4" />
+                 <circle cx="12" cy="14" r="4" />
+                 <line x1="12" y1="6" x2="12.01" y2="6" />
+               </svg>`
+            : `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                 <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                 <line x1="8" y1="21" x2="16" y2="21" />
+                 <line x1="12" y1="17" x2="12" y2="21" />
+               </svg>`;
+
+        const volPercent = Math.round((dev.volume !== undefined ? dev.volume : 0.7) * 100);
+        const isExpanded = expandedCastCmdDevs.has(dev.id);
+
+        card.innerHTML = `
+          <div class="device-top">
+            <div class="device-info">
+              <div class="device-icon">${iconSvg}</div>
+              <div>
+                <div class="device-name">${escapeHtml(dev.name)}</div>
+                <div class="device-meta">
+                  <span class="device-kind-tag">${escapeHtml(kindLabel)}</span>
+                  <span>${escapeHtml(dev.host)}:${dev.port}</span>
+                  <span>&bull; <strong>${escapeHtml(dev.status || 'IDLE')}</strong>${dev.appName ? ` (${escapeHtml(dev.appName)})` : ''}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="device-actions">
+              <button type="button" class="btn btn-ghost btn-sm cast-cmd-toggle-btn" data-id="${escapeHtml(dev.id)}" title="Speak TTS, Play Relaxing Sounds, Launch Apps, or Play Stream URL">${isExpanded ? 'Commands ▴' : 'Commands ▾'}</button>
+              <button type="button" class="btn btn-secondary btn-sm cast-sync-btn" data-id="${escapeHtml(dev.id)}" title="Refresh Now Playing & volume">Sync</button>
+              ${
+                isCasting
+                  ? `<button type="button" class="btn btn-danger btn-sm cast-stop-btn" data-id="${escapeHtml(dev.id)}">Stop</button>`
+                  : `<button type="button" class="btn btn-primary btn-sm cast-start-btn" data-id="${escapeHtml(dev.id)}">Cast Now</button>`
+              }
+              ${
+                dev.isManual
+                  ? `<button type="button" class="btn btn-secondary btn-sm remove-dev-btn" data-id="${escapeHtml(dev.id)}" title="Remove manual device">&times;</button>`
+                  : ''
+              }
+            </div>
+          </div>
+
+          <div class="device-volume-row">
+            <button type="button" class="mute-btn" data-id="${escapeHtml(dev.id)}" data-muted="${Boolean(dev.muted)}" title="Toggle Mute">
+              ${
+                dev.muted
+                  ? `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`
+                  : `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`
+              }
+            </button>
+            <input type="range" class="volume-slider" min="0" max="100" value="${volPercent}" data-id="${escapeHtml(dev.id)}" />
+            <span class="volume-pct">${dev.muted ? 'Muted' : `${volPercent}%`}</span>
+          </div>
+          ${renderCastMediaBlock(dev, media)}
+          ${renderCastCommandDrawer(dev)}
+        `;
+
+        container.appendChild(card);
+      });
+
+      bindCastContainerEvents(container);
+    });
+  }
+
   function formatMediaTime(sec) {
     const s = Math.max(0, Math.floor(Number(sec) || 0));
     const h = Math.floor(s / 3600);
@@ -1779,7 +2095,8 @@
     play: '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><path d="M7 4v16l13-8z"/></svg>',
     pause: '<svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>',
     forward: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>',
-    next: '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg>'
+    next: '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg>',
+    stop: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>'
   };
 
   function renderCastMediaBlock(dev, media) {
@@ -1791,7 +2108,7 @@
         <div class="cast-media-block">
           <div class="cast-media-meta">
             <span class="cast-media-app">${escapeHtml(appName)}</span>
-            <span class="cast-media-sub">App open — nothing loaded to control</span>
+            <span class="cast-media-sub">App active on receiver — click Sync or open Commands ▾ to control</span>
           </div>
         </div>`;
     }
@@ -1804,19 +2121,20 @@
       ? `<img class="cast-media-art" src="${escapeHtml(media.imageUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
       : '<div class="cast-media-art cast-media-art-empty"></div>';
     const seekDisabled = media.canSeek === false ? 'disabled' : '';
+    const seekBarAttr = dur > 0 && media.canSeek !== false ? `data-seek-id="${id}" data-dur="${dur}" title="Click to seek"` : '';
     return `
       <div class="cast-media-block" data-media-dev="${id}">
         <div class="cast-media-top">
           ${art}
           <div class="cast-media-meta">
-            <span class="cast-media-app">${escapeHtml(appName || 'Cast Media')} &bull; ${escapeHtml(st || 'UNKNOWN')}</span>
-            <span class="cast-media-title" title="${escapeHtml(media.title || '')}">${escapeHtml(media.title || 'Untitled')}</span>
+            <span class="cast-media-app">${escapeHtml(appName || 'Cast Media')} &bull; ${escapeHtml(st || 'ACTIVE')}</span>
+            <span class="cast-media-title" title="${escapeHtml(media.title || '')}">${escapeHtml(media.title || appName || 'Playing Media')}</span>
             <span class="cast-media-sub">${escapeHtml([media.artist, media.album].filter(Boolean).join(' — '))}</span>
           </div>
         </div>
         <div class="cast-media-progress">
           <span class="cast-media-time" data-f="pos">${formatMediaTime(pos)}</span>
-          <div class="cast-media-bar"><div class="cast-media-fill" data-f="fill" style="width:${pct.toFixed(1)}%"></div></div>
+          <div class="cast-media-bar" ${seekBarAttr}><div class="cast-media-fill" data-f="fill" style="width:${pct.toFixed(1)}%"></div></div>
           <span class="cast-media-time">${dur > 0 ? formatMediaTime(dur) : 'LIVE'}</span>
         </div>
         <div class="cast-media-controls">
@@ -1825,14 +2143,14 @@
           <button type="button" class="cast-media-btn cast-media-main" data-id="${id}" data-action="${isPlaying ? 'pause' : 'play'}" title="${isPlaying ? 'Pause' : 'Play'}">${isPlaying ? MEDIA_ICONS.pause : MEDIA_ICONS.play}</button>
           <button type="button" class="cast-media-btn" data-id="${id}" data-action="fast_forward" data-seconds="10" title="Forward 10s" ${seekDisabled}>${MEDIA_ICONS.forward}<small>10</small></button>
           <button type="button" class="cast-media-btn" data-id="${id}" data-action="next" title="Next track">${MEDIA_ICONS.next}</button>
+          <button type="button" class="cast-media-btn" data-id="${id}" data-action="stop_media" title="Stop playback">${MEDIA_ICONS.stop}</button>
         </div>
       </div>`;
   }
 
   // Smoothly advance progress bars between server syncs without re-rendering cards
   setInterval(() => {
-    if (!devicesList) return;
-    devicesList.querySelectorAll('.cast-media-block[data-media-dev]').forEach((block) => {
+    document.querySelectorAll('.cast-media-block[data-media-dev]').forEach((block) => {
       const dev = (devices || []).find((d) => d.id === block.dataset.mediaDev);
       const media = dev && dev.media;
       if (!media) return;
@@ -1845,11 +2163,20 @@
     });
   }, 1000);
 
-  async function handleCastMediaAction(deviceId, action, seconds = null) {
+  async function handleCastMediaAction(deviceId, action, seconds = null, extra = {}) {
     const dev = (devices || []).find((d) => d.id === deviceId);
-    const body = { deviceId, action };
-    if (seconds) body.seconds = seconds;
+    const body = { deviceId, action, ...(extra || {}) };
+    if (seconds !== null && seconds !== undefined) body.seconds = seconds;
     try {
+      if (action === 'play_web_media') {
+        showToast(`Searching the internet with gpt-6-luna for "${extra.query || 'media'}"...`, 'info');
+      } else if (action === 'announce') {
+        showToast(`Speaking on ${dev ? dev.name : 'Google Nest'}...`, 'info');
+      } else if (action === 'play_preset') {
+        showToast(`Starting ${extra.preset || 'sound'} on ${dev ? dev.name : 'Google Nest'}...`, 'info');
+      } else if (action === 'launch_app') {
+        showToast(`Launching ${extra.app || 'app'} on ${dev ? dev.name : 'Cast'}...`, 'info');
+      }
       const res = await fetch(apiUrl('cast_media'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1863,13 +2190,29 @@
         renderDevices(true);
       }
       const labels = {
-        play: 'Playing', pause: 'Paused', rewind: `Rewound ${seconds || 15}s`, fast_forward: `Forward ${seconds || 15}s`,
-        next: 'Next track', previous: 'Previous track', restart: 'Restarted'
+        play: 'Playing',
+        pause: 'Paused',
+        stop_media: 'Stopped',
+        rewind: `Rewound ${seconds || 10}s`,
+        fast_forward: `Forward ${seconds || 10}s`,
+        seek: `Seeked to ${formatMediaTime(extra.position_seconds || 0)}`,
+        next: 'Next track',
+        previous: 'Previous track',
+        restart: 'Restarted',
+        announce: `Spoke "${(extra.text || '').slice(0, 36)}"`,
+        play_preset: `Playing ${data.preset?.title || extra.preset || 'Preset'}`,
+        play_web_media: data.resolved
+          ? `Playing ${data.resolved.title || extra.query}${data.resolved.artist ? ` by ${data.resolved.artist}` : ''}${data.resolved.year ? ` (${data.resolved.year})` : ''} [${data.resolved.model || 'gpt-6-luna'}]`
+          : `Playing ${extra.query || 'Web Media'}`,
+        play_url: 'Playing stream URL',
+        launch_app: `Launched ${extra.app || 'App'}`
       };
-      const title = data.media && data.media.title ? ` — ${data.media.title}` : '';
+      const title = data.media && data.media.title && !['announce', 'play_preset', 'play_web_media'].includes(action)
+        ? ` — ${data.media.title}`
+        : '';
       showToast(`${dev ? dev.name : 'Cast'}: ${labels[action] || action}${title}`, 'success');
       if (window.TrevaVos && typeof window.TrevaVos.recordSystemUsage === 'function') {
-        window.TrevaVos.recordSystemUsage('cast', `${dev ? dev.name : 'Cast'} ${action}`, { boost: 0.26 });
+        window.TrevaVos.recordSystemUsage('cast', `${dev ? dev.name : 'Cast'} ${action}`, { boost: 0.28 });
       }
       syncVosState();
     } catch (err) {
@@ -2314,6 +2657,17 @@
         aiModelSelect.value = smartConfig.openai.model;
       }
     }
+    if (smartConfig.googleNest) {
+      if (googleNestProjectIdInput) googleNestProjectIdInput.value = smartConfig.googleNest.projectId || '';
+      if (googleNestClientIdInput) googleNestClientIdInput.value = smartConfig.googleNest.clientId || '';
+      if (googleNestClientSecretInput) {
+        googleNestClientSecretInput.value = smartConfig.googleNest.hasClientSecret ? SAVED_SECRET_MASK : '';
+      }
+      if (googleNestRefreshTokenInput) {
+        googleNestRefreshTokenInput.value = smartConfig.googleNest.hasRefreshToken ? SAVED_SECRET_MASK : '';
+      }
+    }
+    updateSmartAndCastCounters();
     updateLocalSessionStatusUi();
   }
 
@@ -2715,9 +3069,7 @@
     );
     if (!force && (sig === lastSmartSig || hasBusySceneChip)) return;
     lastSmartSig = sig;
-    if (dockSmartCount) {
-      dockSmartCount.textContent = String(wifiList.length + bleList.length);
-    }
+    updateSmartAndCastCounters();
 
     if (wifiList.length === 0 && bleList.length === 0) {
       smartDevicesGrid.innerHTML = `
@@ -3086,7 +3438,22 @@
   }
 
   // Smart Section Button & Form Wiring
-  scanSmartWifiBtn.addEventListener('click', () => discoverSmartWifi(false));
+  scanSmartWifiBtn.addEventListener('click', () => {
+    discoverSmartWifi(false);
+    discoverLocalDevices(true);
+  });
+  if (smartTabScanCastBtn) {
+    smartTabScanCastBtn.addEventListener('click', () => discoverLocalDevices(false));
+  }
+  if (modalScanCastBtn) {
+    modalScanCastBtn.addEventListener('click', () => discoverLocalDevices(false));
+  }
+  if (modalSelectBtBtn && selectBtAudioBtn) {
+    modalSelectBtBtn.addEventListener('click', () => {
+      smartKeysModal.classList.add('hidden');
+      selectBtAudioBtn.click();
+    });
+  }
   syncSmartCloudBtn.addEventListener('click', () => syncSmartCloud('all'));
   pairBleLightBtn.addEventListener('click', () => pairBluetoothSmartLight());
   addSmartManualBtn.addEventListener('click', () => smartManualForm.classList.toggle('hidden'));
@@ -3229,6 +3596,14 @@
           model: aiModelSelect ? aiModelSelect.value : 'gpt-realtime-mini'
         };
       }
+      if (googleNestProjectIdInput || googleNestClientIdInput) {
+        savePayload.googleNest = {
+          projectId: googleNestProjectIdInput ? googleNestProjectIdInput.value.trim() : '',
+          clientId: googleNestClientIdInput ? googleNestClientIdInput.value.trim() : '',
+          clientSecret: googleNestClientSecretInput ? googleNestClientSecretInput.value.trim() : '',
+          refreshToken: googleNestRefreshTokenInput ? googleNestRefreshTokenInput.value.trim() : ''
+        };
+      }
 
       const saveRes = await fetch(apiUrl('smart_config_save'), {
         method: 'POST',
@@ -3334,9 +3709,9 @@
     const lnk = sc?.id ? (smartSceneLinks || []).find((x) => x.id === sc.id) : null;
     if (lnk && lnk.systemBus) return lnk.systemBus;
     const txt = `${sc?.name || ''} ${sc?.targetDevice || lnk?.targetDevice || ''}`.toLowerCase();
-    if (/vac|aspir|clean|mop|dock/.test(txt)) return 'vacuum';
-    if (/cast|music|música|spotif|radio|sonido|audio|speaker/.test(txt)) return 'cast';
-    if (/lamp|lámpara|luz|light|rgb|magic|red|bright|warm|cool|color|blaze|fireplace|confort/.test(txt)) return 'lights';
+    if (/sh7p|vac|aspir|clean|mop|dock/.test(txt)) return 'vacuum';
+    if (/knowhere|cast|music|música|spotif|radio|sonido|audio|speaker/.test(txt)) return 'cast';
+    if (/lamp|lámpara|luz|light|rgb|magic|red|bright|warm|cool|color|blaze|fireplace|lujuria|confort/.test(txt)) return 'lights';
     if (/voz|voice|hola/.test(txt)) return 'voice';
     return 'ir';
   }
@@ -3587,7 +3962,7 @@
       const input = document.createElement('input');
       input.type = 'text';
       input.className = 'text-input';
-      input.placeholder = 'Custom voice commands (comma-separated, e.g. air conditioner 24, cool 24)';
+      input.placeholder = 'Custom voice commands (comma-separated, e.g. air conditioner 24, thunder 24)';
       input.value = Array.isArray(lnk.customPhrases) ? lnk.customPhrases.join(', ') : '';
       const saveBtn = document.createElement('button');
       saveBtn.type = 'button';
@@ -4757,9 +5132,28 @@
       onControlSmart: (id, payload) => controlWifiSmartDevice(id, payload),
       onControlCast: (id, payload) => {
         const d = (devices || []).find((x) => x.id === id);
+        if (payload && payload.volume !== undefined) {
+          const level = Math.max(0, Math.min(1, Number(payload.volume) / 100));
+          if (d) {
+            d.volume = level;
+            d.muted = false;
+          }
+          fetch(apiUrl('cast_volume'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceId: id, level, muted: false })
+          }).catch(() => {});
+          renderDevices(true);
+          syncVosState();
+          return;
+        }
         if (payload && payload.media_action) {
           if (window.TrevaVos) window.TrevaVos.pushLog('CAST', `${d ? d.name : id} -> ${payload.media_action}`, 'ok');
-          handleCastMediaAction(id, payload.media_action, payload.seconds || null);
+          const extra = {};
+          if (payload.preset) extra.preset = payload.preset;
+          if (payload.text) extra.text = payload.text;
+          if (payload.app) extra.app = payload.app;
+          handleCastMediaAction(id, payload.media_action, payload.seconds || null, extra);
           return;
         }
         if (d && window.TrevaVos) {

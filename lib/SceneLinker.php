@@ -69,30 +69,35 @@ class SceneLinker
         if ($f === 'tv' || $f === 'tele' || $f === 'televisor') {
             return self::findDevByCategoryOrName($devices, ['ir_tv'], ['tv']);
         }
-        if ($f === 'loudspeaker' || $f === 'parlante' || $f === 'speaker' || $f === 'speakers' || $f === 'audio') {
-            return self::findDevByCategoryOrName($devices, ['ir_audio'], ['speaker', 'loudspeaker', 'parlante']);
+        if ($f === 'loudspeaker' || $f === 'parlante' || $f === 'speaker' || $f === 'edifier') {
+            return self::findDevByCategoryOrName($devices, ['ir_audio'], ['edifier', 'loudspeaker']);
         }
-        if ($f === 'aire' || $f === 'ac' || str_contains($f, 'air cond')) {
-            return self::findDevByCategoryOrName($devices, ['ir_ac'], ['aire', 'ac']);
+        if ($f === 'aire' || $f === 'ac' || str_contains($f, 'thunder')) {
+            return self::findDevByCategoryOrName($devices, ['ir_ac'], ['aire']);
         }
-        if ($f === 'purificador' || $f === 'purifier' || str_contains($f, 'air purifier')) {
-            return self::findDevByCategoryOrName($devices, ['ir_purifier'], ['purifier', 'purificador']);
+        if ($f === 'r-312' || $f === 'r312' || $f === 'purificador' || $f === 'purifier') {
+            return self::findDevByCategoryOrName($devices, ['ir_purifier'], ['r-312']);
         }
-        if ($f === 'fan' || $f === 'fans' || $f === 'ventilador') {
-            return self::findDevByCategoryOrName($devices, ['ir_fan'], ['fan', 'ventilador']);
+        if ($f === 'a735' || $f === 'sa7335') {
+            return self::findDevByCategoryOrName($devices, ['ir_fan'], ['sa7335']);
         }
-        if (str_starts_with($f, 'lampara') || str_starts_with($f, 'lamp')) {
-            if (preg_match('/lampara\s*([0-9]+)|lamp\s*([0-9]+)/', $f, $m)) {
-                $num = $m[1] !== '' ? $m[1] : ($m[2] ?? '');
-                return self::findDevByCategoryOrName($devices, ['light'], ['lampara' . $num, 'lamp' . $num, 'lamp ' . $num]);
+        if ($f === 'fan 2' || $f === 'fan2' || $f === 'r-i_-2') {
+            return self::findDevByCategoryOrName($devices, ['ir_fan'], ['r-i_-2']);
+        }
+        if ($f === 'fan') {
+            return self::findDevByCategoryOrName($devices, ['ir_fan'], ['sa7335', 'r-i_-2']);
+        }
+        if (str_starts_with($f, 'lampara')) {
+            if (preg_match('/lampara\s*([123])/', $f, $m)) {
+                return self::findDevByCategoryOrName($devices, ['light'], ['lampara' . $m[1]]);
             }
             return ['id' => 'lights_group', 'name' => 'Lights Group', 'category' => 'light'];
         }
-        if (str_contains($f, 'led') || str_contains($f, 'strip')) {
-            return self::findDevByCategoryOrName($devices, ['light'], ['led', 'strip']);
+        if ($f === 'protocol' || str_contains($f, '5050')) {
+            return ['id' => '5050_led', 'name' => '5050 LED / Protocol', 'category' => 'light'];
         }
-        if ($f === 'vacuum' || $f === 'robot' || $f === 'aspiradora') {
-            return self::findDevByCategoryOrName($devices, ['vacuum'], ['vacuum', 'robot', 'aspiradora']);
+        if ($f === 'fika' || $f === 'sh7p') {
+            return self::findDevByCategoryOrName($devices, ['vacuum'], ['sh7p', 'fika']);
         }
         return null;
     }
@@ -156,7 +161,8 @@ class SceneLinker
                 "aire en {$temp}",
                 "poner el aire en {$temp}",
                 "pon el aire en {$temp}",
-                "aire acondicionado {$temp} grados"
+                "aire acondicionado {$temp} grados",
+                "thunder {$temp}"
             ]);
         } elseif ($mode === 'dry') {
             $phrases = array_merge($phrases, [
@@ -247,11 +253,11 @@ class SceneLinker
                         $targetDeviceName = $dName;
                         $targetCategory = (string)($dev['category'] ?? '');
                     }
-                } elseif ($exec === 'deviceGroupDpIssue') {
+                } elseif ($eid === '17135609') {
                     $dName = 'Lights Group';
-                    $addTargetDev($eid);
+                    $addTargetDev('17135609');
                     if ($targetDeviceName === '') {
-                        $targetDeviceId = $eid;
+                        $targetDeviceId = '17135609';
                         $targetDeviceName = $dName;
                         $targetCategory = 'light';
                     }
@@ -327,13 +333,14 @@ class SceneLinker
 
             $sufFold = self::foldText($suffix);
             if ($sufFold === 'jetmode' || preg_match('/\bjet\s*mode\b/', $sufFold)) {
+                // Smart Life stores AC Jet / Power Mode under the "R-312":jetmode IR scene
                 $aireDev = self::resolveDeviceAlias('aire', $allDevices);
-                if ($aireDev && $targetDeviceName === '') {
+                if ($aireDev) {
                     $targetDeviceId = (string)($aireDev['id'] ?? $targetDeviceId);
-                    $targetDeviceName = (string)($aireDev['name'] ?? 'AC');
+                    $targetDeviceName = (string)($aireDev['name'] ?? 'Aire');
                     $targetCategory = (string)($aireDev['category'] ?? 'ir_ac');
-                } elseif ($targetDeviceName === '') {
-                    $targetDeviceName = 'AC';
+                } else {
+                    $targetDeviceName = 'Aire';
                     $targetCategory = 'ir_ac';
                 }
                 if (empty($summaryParts)) {
@@ -359,10 +366,10 @@ class SceneLinker
             // Map common Tuya sub-command names to natural voice inputs
             $devVoice = $targetDeviceName !== '' ? strtolower($targetDeviceName) : strtolower($prefix);
             $extraAliases = [$devVoice];
-            if ($targetCategory === 'ir_audio') $extraAliases = ['speaker', 'speakers', 'parlante', 'audio'];
+            if ($targetCategory === 'ir_audio') $extraAliases = ['edifier', 'speaker', 'speakers', 'parlante'];
             elseif ($targetCategory === 'ir_tv') $extraAliases = ['tv', 'television', 'tele'];
             elseif ($targetCategory === 'ir_fan') $extraAliases = ['fan', 'ventilador', strtolower($targetDeviceName)];
-            elseif ($targetCategory === 'ir_purifier') $extraAliases = ['purifier', 'air purifier', 'purificador'];
+            elseif ($targetCategory === 'ir_purifier') $extraAliases = ['purifier', 'air purifier', 'purificador', 'r-312'];
             elseif ($targetCategory === 'ir_ac') $extraAliases = ['ac', 'air conditioner', 'aire'];
 
             if (str_contains($sufFold, 'poweroff') || str_ends_with($sufFold, ':0') || str_ends_with($sufFold, ':off')) {
@@ -442,28 +449,56 @@ class SceneLinker
             }
         }
 
-        // Generic standalone scene voice keywords
+        // Handle Thunder{temp} even if synced without actions[]
+        if ($structuredIntent === null && preg_match('/\bthunder\s*(\d{2})\b/i', $name, $tm)) {
+            $tVal = (int)$tm[1];
+            $acAlias = self::findDevByCategoryOrName($allDevices, ['ir_ac'], ['aire']);
+            if ($targetDeviceName === '' && $acAlias) {
+                $targetDeviceId = (string)($acAlias['id'] ?? '');
+                $targetDeviceName = (string)($acAlias['name'] ?? 'Aire');
+                $targetCategory = 'ir_ac';
+            }
+            $structuredIntent = [
+                'type' => 'ir_ac',
+                'modeCode' => 0,
+                'mode' => 'cool',
+                'modeEn' => 'Cool',
+                'modeEs' => 'Frío',
+                'temp' => $tVal,
+                'fanSpeed' => 1,
+                'swing' => 0,
+                'rawKey' => "M0_T{$tVal}_S1_0"
+            ];
+            if (empty($summaryParts)) {
+                $summaryParts[] = "IR AC Cool {$tVal}°C (named scene {$name})";
+            }
+            $autoPhrases = array_merge($autoPhrases, self::buildAcPhrases($structuredIntent, $name));
+        }
+
+        // Specific well-known standalone scenes
         if ($foldedName === 'power off') {
             if ($targetDeviceName === '') {
-                $acAlias = self::findDevByCategoryOrName($allDevices, ['ir_ac'], ['aire', 'ac']);
+                $acAlias = self::findDevByCategoryOrName($allDevices, ['ir_ac'], ['aire']);
                 $targetDeviceId = (string)($acAlias['id'] ?? '');
-                $targetDeviceName = $acAlias ? (string)$acAlias['name'] : 'AC';
+                $targetDeviceName = $acAlias ? (string)$acAlias['name'] : 'Aire';
                 $targetCategory = 'ir_ac';
             }
             $structuredIntent = $structuredIntent ?? ['type' => 'ir_power', 'power' => false];
-            if (empty($summaryParts)) $summaryParts[] = 'Power Off IR scene (AC Off)';
+            if (empty($summaryParts)) $summaryParts[] = 'Power Off IR scene (Aire / AC Off)';
             $autoPhrases = array_merge($autoPhrases, ['turn off the air conditioner', 'turn off ac', 'turn off aire', 'apagar el aire', 'power off']);
-        } elseif ($foldedName === 'switch parlante' || $foldedName === 'switch speaker') {
+        } elseif ($foldedName === 'switch parlante') {
             if ($targetDeviceName === '') {
-                $edAlias = self::findDevByCategoryOrName($allDevices, ['ir_audio'], ['speaker', 'loudspeaker', 'parlante']);
+                $edAlias = self::findDevByCategoryOrName($allDevices, ['ir_audio'], ['edifier', 'loudspeaker']);
                 $targetDeviceId = (string)($edAlias['id'] ?? '');
-                $targetDeviceName = $edAlias ? (string)$edAlias['name'] : 'Speakers';
+                $targetDeviceName = $edAlias ? (string)$edAlias['name'] : 'Edifier';
                 $targetCategory = 'ir_audio';
             }
             $structuredIntent = $structuredIntent ?? ['type' => 'ir_power_toggle'];
-            if (empty($summaryParts)) $summaryParts[] = 'Toggle Speaker IR power';
-            $autoPhrases = array_merge($autoPhrases, ['switch speaker', 'switch parlante', 'turn off speakers', 'turn on speakers', 'apagar parlante', 'prender parlante']);
-        } elseif ($foldedName === 'audioritmico' || $foldedName === 'music sync') {
+            if (empty($summaryParts)) $summaryParts[] = 'Toggle Edifier Loudspeaker IR power';
+            $autoPhrases = array_merge($autoPhrases, ['switch speaker', 'switch parlante', 'toggle edifier', 'turn off edifier', 'turn on edifier', 'apagar parlante', 'prender parlante']);
+        } elseif ($foldedName === 'fika') {
+            $autoPhrases = array_merge($autoPhrases, ['start fika', 'start robot vacuum', 'start cleaning', 'clean the house', 'iniciar fika', 'iniciar aspiradora']);
+        } elseif ($foldedName === 'audioritmico') {
             $autoPhrases = array_merge($autoPhrases, ['music sync lights', 'lights music mode', 'audioritmico', 'modo musica luces']);
         } elseif ($foldedName === 'modo escena') {
             $autoPhrases = array_merge($autoPhrases, ['lights scene mode', 'modo escena luces']);
@@ -474,21 +509,28 @@ class SceneLinker
             $autoPhrases = array_merge($autoPhrases, ['tv power', 'turn on tv', 'turn off tv', 'apagar tele', 'prender tele']);
         } elseif ($foldedName === 'power' && $targetCategory === 'ir_purifier') {
             $structuredIntent = $structuredIntent ?? ['type' => 'ir_power_toggle'];
-            $autoPhrases = array_merge($autoPhrases, ['purifier power', 'turn on purifier', 'turn off purifier', 'apagar purificador', 'prender purificador']);
+            $autoPhrases = array_merge($autoPhrases, ['purifier power', 'turn on purifier', 'turn off purifier', 'r-312 power', 'apagar purificador', 'prender purificador']);
         } elseif ($foldedName === 'ahorro' && $targetCategory === 'ir_tv') {
             $autoPhrases = array_merge($autoPhrases, ['tv eco mode', 'tv energy saving', 'tv ahorro', 'ahorro tv']);
         } elseif ($foldedName === 'purificador' && $targetCategory === 'ir_purifier') {
             $autoPhrases = array_merge($autoPhrases, ['purifier mode', 'purificador']);
         } elseif ($foldedName === 'source' && $targetCategory === 'ir_purifier') {
-            $autoPhrases = array_merge($autoPhrases, ['purifier source']);
+            $autoPhrases = array_merge($autoPhrases, ['purifier source', 'r-312 source']);
+        } elseif (preg_match('/^5050(on|off|up|down)$/', $foldedName, $m50)) {
+            $targetDeviceName = $targetDeviceName ?: '5050 LED';
+            $targetCategory = $targetCategory ?: 'light';
+            $actWord = ['on' => 'turn on', 'off' => 'turn off', 'up' => 'brighten', 'down' => 'dim'][$m50[1]];
+            $autoPhrases = array_merge($autoPhrases, ["{$actWord} 5050", "5050 {$m50[1]}"]);
         } elseif ($foldedName === 'swing') {
             $targetDeviceName = $targetDeviceName ?: 'Fan';
             $targetCategory = $targetCategory ?: 'ir_fan';
             $autoPhrases = array_merge($autoPhrases, ['fan swing', 'toggle swing', 'oscilacion ventilador']);
         } elseif ($foldedName === 'ion') {
-            $targetDeviceName = $targetDeviceName ?: 'Purifier';
+            $targetDeviceName = $targetDeviceName ?: 'R-312';
             $targetCategory = $targetCategory ?: 'ir_purifier';
             $autoPhrases = array_merge($autoPhrases, ['purifier ionizer', 'ion mode', 'ionizador']);
+        } elseif (is_numeric($name) && $name === '40') {
+            $autoPhrases = array_merge($autoPhrases, ['scene 40', 'preset 40', 'lamps preset 40', 'escena 40']);
         } elseif ($foldedName === 'bright up' || $foldedName === 'red' || $foldedName === 'fireplace') {
             $targetDeviceId = $targetDeviceId ?: 'lights_group';
             $targetDeviceName = $targetDeviceName ?: 'Lights Group';
@@ -496,12 +538,26 @@ class SceneLinker
             $addTargetDev($targetDeviceId);
             if (empty($summaryParts)) $summaryParts[] = "Lighting scene preset: {$name}";
         } elseif ($foldedName === 'confort') {
-            $acAlias = self::findDevByCategoryOrName($allDevices, ['ir_ac'], ['aire', 'ac']);
+            $acAlias = self::findDevByCategoryOrName($allDevices, ['ir_ac'], ['aire']);
             $targetDeviceId = (string)($acAlias['id'] ?? $targetDeviceId);
-            $targetDeviceName = $acAlias ? (string)$acAlias['name'] : 'AC';
+            $targetDeviceName = $acAlias ? (string)$acAlias['name'] : 'Aire';
             $targetCategory = $targetCategory ?: 'ir_ac';
             if ($targetDeviceId !== '') $addTargetDev($targetDeviceId);
             if (empty($summaryParts)) $summaryParts[] = "AC Comfort preset: {$name}";
+        } elseif ($foldedName === 'lujuria') {
+            $purAlias = self::findDevByCategoryOrName($allDevices, ['ir_purifier'], ['r-312']);
+            $targetDeviceId = (string)($purAlias['id'] ?? $targetDeviceId);
+            $targetDeviceName = $purAlias ? (string)$purAlias['name'] : 'R-312';
+            $targetCategory = $targetCategory ?: 'ir_purifier';
+            if ($targetDeviceId !== '') $addTargetDev($targetDeviceId);
+            if (empty($summaryParts)) $summaryParts[] = "Purifier scene preset: {$name}";
+        } elseif ($foldedName === 'knowhere') {
+            $fan2Alias = self::findDevByCategoryOrName($allDevices, ['ir_fan'], ['r-i_-2']);
+            $targetDeviceId = (string)($fan2Alias['id'] ?? 'knowhere');
+            $targetDeviceName = $fan2Alias ? (string)$fan2Alias['name'] : 'Knowhere';
+            $targetCategory = $targetCategory ?: 'ir_fan';
+            $addTargetDev($targetDeviceId);
+            if (empty($summaryParts)) $summaryParts[] = "Knowhere ambience / room scene";
         }
 
         if ($targetDeviceId !== '') {
@@ -509,17 +565,17 @@ class SceneLinker
         }
 
         $systemBus = 'ir';
-        if ($targetCategory === 'vacuum') {
+        if ($targetCategory === 'vacuum' || $foldedName === 'fika') {
             $systemBus = 'vacuum';
-        } elseif ($targetCategory === 'light' || $targetCategory === 'ble_light' || str_contains($foldedName, 'lampara') || str_contains($foldedName, 'lamp') || str_contains($foldedName, 'light')) {
+        } elseif ($targetCategory === 'light' || $targetCategory === 'ble_light' || str_starts_with($foldedName, '5050') || str_contains($foldedName, 'lampara') || str_contains($foldedName, 'protocol')) {
             $systemBus = 'lights';
-        } elseif ($targetCategory === 'ir_audio' || $targetCategory === 'ir_tv' || str_contains($foldedName, 'parlante') || str_contains($foldedName, 'loudspeaker') || str_contains($foldedName, 'speaker')) {
-            $systemBus = ($targetCategory === 'ir_audio') ? 'cast' : 'ir';
+        } elseif ($targetCategory === 'ir_audio' || $targetCategory === 'ir_tv' || str_contains($foldedName, 'parlante') || str_contains($foldedName, 'loudspeaker') || $foldedName === 'knowhere') {
+            $systemBus = ($targetCategory === 'ir_audio' || $foldedName === 'knowhere') ? 'cast' : 'ir';
         } elseif (str_starts_with($targetCategory, 'ir_')) {
             $systemBus = 'ir';
         }
 
-        // Always associate the scene's own clean name & generic activation triggers so all synced scenes work via voice
+        // Always associate the scene's own clean name & generic activation triggers so all 96 scenes work via voice
         $cleanSelf = trim(str_replace(['"', ':'], ' ', $name));
         $cleanSelf = preg_replace('/\s+/', ' ', $cleanSelf) ?? $cleanSelf;
         $autoPhrases[] = $name;
@@ -625,19 +681,22 @@ class SceneLinker
             $mode = 'auto';
         } elseif (preg_match('/\b(jet\s*mode|power\s*mode|modo\s*jet|modo\s*power|turbo\s*mode|modo\s*turbo|ac\s*turbo|aire\s*turbo)\b/', $q)) {
             $mode = 'jet';
-        } elseif (preg_match('/\b(cool|cooling|frio)\b/', $q)) {
+        } elseif (preg_match('/\b(cool|cooling|frio|thunder)\b/', $q)) {
             $mode = 'cool';
         }
 
         $temp = null;
         $hasAcContext = ($dh === 'aire' || $dh === 'ac' || $dh === 'ir_ac')
-            || preg_match('/\b(ac|aire|air\s*condition\w*|acondicionador|clima|degrees?|grados?)\b/', $q) === 1;
+            || preg_match('/\b(ac|aire|air\s*condition\w*|acondicionador|thunder|clima|degrees?|grados?)\b/', $q) === 1;
         if ($mode === null && $hasAcContext && preg_match('/\b(turbo|jet)\b/', $q)) {
             $mode = 'jet';
         }
 
         if ($hasAcContext && preg_match('/\b(1[6-9]|2[0-9]|30)\b/', $q, $tm)) {
             $temp = (int)$tm[1];
+        } elseif (preg_match('/\bthunder\s*(1[6-9]|2[0-9]|30)\b/', $q, $tm2)) {
+            $temp = (int)$tm2[1];
+            $hasAcContext = true;
         }
 
         // Unambiguous standalone AC mode keywords ("put it on dry mode", "modo seco")
@@ -659,12 +718,12 @@ class SceneLinker
     {
         if ($normQ === '') return '';
         $patterns = [
-            'ir_ac'       => '/\b(ac|aire|air\s*condition\w*|acondicionador|clima)\b/',
+            'ir_ac'       => '/\b(ac|aire|air\s*condition\w*|acondicionador|clima|thunder)\b/',
             'ir_tv'       => '/\b(tv|tele|televisor|television|apple\s*tv)\b/',
-            'ir_purifier' => '/\b(purifier|purificador)\b/',
-            'ir_audio'    => '/\b(speaker|speakers|parlante|altavoz|soundbar|audio)\b/',
-            'vacuum'      => '/\b(vacuum|aspiradora|robot)\b/',
-            'ir_fan'      => '/\b(fan|fans|ventilador)\b/',
+            'ir_purifier' => '/\b(purifier|purificador|r\s*312)\b/',
+            'ir_audio'    => '/\b(edifier|speaker|speakers|parlante|altavoz|soundbar|audio)\b/',
+            'vacuum'      => '/\b(vacuum|aspiradora|sh7p|robot)\b/',
+            'ir_fan'      => '/\b(fan|fans|sa7335)\b/',
         ];
         foreach ($patterns as $cat => $rx) {
             if (preg_match($rx, $normQ)) {
@@ -882,7 +941,7 @@ class SceneLinker
                 if ($wantMode !== null) $queryParts[] = "{$wantMode} mode";
                 if ($wantTemp !== null) $queryParts[] = (string)$wantTemp;
 
-                $res = self::resolveSceneForCommand($store, implode(' ', $queryParts), $devName !== '' ? $devName : 'AC');
+                $res = self::resolveSceneForCommand($store, implode(' ', $queryParts), 'Aire');
                 if (!empty($res['matched'])) return $res;
                 if (($res['matchReason'] ?? '') === 'ac_temp_not_in_scenes') return $res;
             }

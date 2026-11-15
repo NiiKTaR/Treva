@@ -11,10 +11,82 @@ class CastV2
     private const NS_MEDIA      = 'urn:x-cast:com.google.cast.media';
     private const DEFAULT_RECEIVER_APP_ID = 'CC1AD845';
 
+    public const KNOWN_APPS = [
+        'youtube'         => ['appId' => '233637DE', 'name' => 'YouTube'],
+        'youtube_music'   => ['appId' => '2DB7CC49', 'name' => 'YouTube Music'],
+        'spotify'         => ['appId' => 'CC32E753', 'name' => 'Spotify'],
+        'netflix'         => ['appId' => 'CA5E8412', 'name' => 'Netflix'],
+        'relaxing_sounds' => ['appId' => '9731D581', 'name' => 'Relaxing Sounds'],
+        'default_media'   => ['appId' => 'CC1AD845', 'name' => 'Default Media Receiver'],
+        'backdrop'        => ['appId' => 'E8C28D3C', 'name' => 'Ambient Backdrop'],
+    ];
+
+    public const SOUND_PRESETS = [
+        'country_night' => [
+            'title' => 'Sonidos del campo en la noche',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/country_night_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/country_night.png'
+        ],
+        'rain' => [
+            'title' => 'Rain Sounds',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/rain_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/rain.png'
+        ],
+        'ocean' => [
+            'title' => 'Ocean Waves',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/ocean_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/ocean.png'
+        ],
+        'thunderstorm' => [
+            'title' => 'Thunderstorm Sounds',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/thunderstorm_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/thunderstorm.png'
+        ],
+        'fireplace' => [
+            'title' => 'Crackling Fireplace',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/fireplace_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/fireplace.png'
+        ],
+        'forest' => [
+            'title' => 'Forest Ambience',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/forest_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/forest.png'
+        ],
+        'running_water' => [
+            'title' => 'Running Stream',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/running_water_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/running_water.png'
+        ],
+        'white_noise' => [
+            'title' => 'White Noise',
+            'artist' => 'Google Nest Relaxation Sounds',
+            'url' => 'https://storage.googleapis.com/relaxation-sounds/white_noise_3600.mp3',
+            'contentType' => 'audio/mp3',
+            'imageUrl' => 'https://www.gstatic.com/voice_delight/images/relaxation_sounds/icons/white_noise.png'
+        ],
+    ];
+
     private $sock = null;
     private string $senderId;
     private int $reqId = 1;
     private array $connectedTransports = [];
+    private string $lastHost = '';
+    private int $lastPort = 8009;
+    private float $lastTimeout = 4.5;
 
     public function __construct()
     {
@@ -23,6 +95,9 @@ class CastV2
 
     public function connect(string $host, int $port = 8009, float $timeout = 4.5): void
     {
+        $this->lastHost = $host;
+        $this->lastPort = $port;
+        $this->lastTimeout = $timeout;
         $ctx = stream_context_create([
             'ssl' => [
                 'verify_peer' => false,
@@ -56,13 +131,9 @@ class CastV2
     public function close(): void
     {
         if ($this->sock) {
-            foreach (array_keys($this->connectedTransports) as $destId) {
-                try {
-                    $this->send($this->senderId, (string)$destId, self::NS_CONNECTION, ['type' => 'CLOSE']);
-                } catch (Throwable $e) {
-                    // Ignore socket errors during cleanup
-                }
-            }
+            // Do NOT send NS_CONNECTION CLOSE to active media transportIds on teardown:
+            // CAF / Google Cast receivers treat an explicit sender CLOSE as a signal to
+            // shut down cloud-launched or single-sender media sessions.
             $this->connectedTransports = [];
             @fclose($this->sock);
             $this->sock = null;
@@ -92,6 +163,8 @@ class CastV2
             $imageUrl = (string)$images[0]['url'];
         }
 
+        $hasQueue = !empty($ms['items']) || isset($ms['currentItemId']);
+
         return [
             'mediaSessionId' => isset($ms['mediaSessionId']) ? (int)$ms['mediaSessionId'] : null,
             'playerState' => strtoupper((string)($ms['playerState'] ?? 'UNKNOWN')),
@@ -100,8 +173,8 @@ class CastV2
             'supportedMediaCommands' => $cmds,
             'canPause' => (($cmds & 1) !== 0),
             'canSeek' => (($cmds & 2) !== 0),
-            'canNext' => (($cmds & 64) !== 0),
-            'canPrev' => (($cmds & 128) !== 0),
+            'canNext' => (($cmds & 64) !== 0) || $hasQueue,
+            'canPrev' => (($cmds & 128) !== 0) || $hasQueue,
             'duration' => isset($media['duration']) ? round((float)$media['duration'], 2) : null,
             'contentId' => (string)($media['contentId'] ?? ''),
             'contentType' => (string)($media['contentType'] ?? ''),
@@ -141,6 +214,7 @@ class CastV2
                 'appId' => (string)($activeApp['appId'] ?? ''),
                 'displayName' => (string)($activeApp['displayName'] ?? ''),
                 'statusText' => (string)($activeApp['statusText'] ?? ''),
+                'iconUrl' => (string)($activeApp['iconUrl'] ?? ''),
                 'sessionId' => (string)($activeApp['sessionId'] ?? ''),
                 'transportId' => $transportId,
                 'supportsMedia' => $supportsMedia
@@ -156,7 +230,38 @@ class CastV2
                 $reply = $this->waitForMediaReply($rid, 2.5);
                 if (!empty($reply['status'][0]) && is_array($reply['status'][0])) {
                     $mediaSession = self::normalizeMediaSession($reply['status'][0]);
+                    if ($mediaSession['imageUrl'] === '' && $appInfo['iconUrl'] !== '') {
+                        $mediaSession['imageUrl'] = $appInfo['iconUrl'];
+                    }
+                    if ($mediaSession['title'] === '' && $appInfo['statusText'] !== '') {
+                        $mediaSession['title'] = (string)preg_replace('/^(Casting|Playing|Now Playing):\s*/i', '', $appInfo['statusText']);
+                    }
                 }
+            }
+
+            if ($mediaSession === null && ($appInfo['statusText'] !== '' || $appInfo['displayName'] !== '')) {
+                $cleanTitle = $appInfo['statusText'] !== ''
+                    ? (string)preg_replace('/^(Casting|Playing|Now Playing):\s*/i', '', $appInfo['statusText'])
+                    : $appInfo['displayName'];
+                $mediaSession = [
+                    'mediaSessionId' => 0,
+                    'playerState' => 'ACTIVE',
+                    'playbackRate' => 1.0,
+                    'currentTime' => 0.0,
+                    'supportedMediaCommands' => 0,
+                    'canPause' => $supportsMedia,
+                    'canSeek' => false,
+                    'canNext' => false,
+                    'canPrev' => false,
+                    'duration' => null,
+                    'contentId' => '',
+                    'contentType' => '',
+                    'streamType' => 'LIVE',
+                    'title' => $cleanTitle,
+                    'artist' => $appInfo['displayName'],
+                    'album' => '',
+                    'imageUrl' => $appInfo['iconUrl']
+                ];
             }
         }
 
@@ -181,6 +286,7 @@ class CastV2
 
     public function controlMedia(string $action, array $opts = []): array
     {
+        $actionNorm = strtolower(trim($action));
         $state = $this->getMediaState(null, true);
         $app = $state['app'] ?? null;
         if (!$app) {
@@ -188,20 +294,29 @@ class CastV2
         }
         $transportId = (string)($app['transportId'] ?? '');
         $appName = $app['displayName'] ?: 'Cast app';
+        if ($actionNorm === 'stop_media' && ($transportId === '' || empty($state['mediaSession']['mediaSessionId']))) {
+            $this->stopCurrentApp();
+            return [
+                'action' => 'stop_media',
+                'meta' => ['stoppedApp' => $appName],
+                'state' => ['volume' => $state['volume'] ?? null, 'app' => null, 'mediaSession' => null],
+                'mediaSession' => null
+            ];
+        }
         if ($transportId === '' || empty($app['supportsMedia'])) {
             throw new RuntimeException("{$appName} does not expose Google Cast media transport controls.");
         }
 
         $ms = $state['mediaSession'] ?? null;
-        if (!$ms || empty($ms['mediaSessionId'])) {
-            throw new RuntimeException("{$appName} is open, but no track or video is currently loaded.");
+        $msid = (int)($ms['mediaSessionId'] ?? 0);
+        if ($msid <= 0) {
+            // Try mediaSessionId=1 fallback for receivers that omit GET_STATUS status array until commanded
+            $msid = 1;
         }
 
-        $msid = (int)$ms['mediaSessionId'];
         $playerState = (string)($ms['playerState'] ?? 'UNKNOWN');
         $curTime = (float)($ms['currentTime'] ?? 0.0);
         $dur = $ms['duration'] ?? null;
-        $actionNorm = strtolower(trim($action));
         $rid = $this->nextReqId();
         $reply = [];
         $metaOut = [
@@ -445,17 +560,79 @@ class CastV2
         return $stopped;
     }
 
-    public function loadMedia(string $streamUrl, string $contentType, string $title = 'Treva Live Cast', string $subtitle = 'Screen & Sound'): array
+    public static function resolveSoundPreset(string $key): ?array
     {
+        $norm = strtolower(trim(str_replace(['-', ' '], '_', $key)));
+        if (isset(self::SOUND_PRESETS[$norm])) {
+            return self::SOUND_PRESETS[$norm] + ['key' => $norm];
+        }
+        $aliases = [
+            'country' => 'country_night',
+            'campo' => 'country_night',
+            'noche' => 'country_night',
+            'night' => 'country_night',
+            'crickets' => 'country_night',
+            'lluvia' => 'rain',
+            'tormenta' => 'thunderstorm',
+            'thunder' => 'thunderstorm',
+            'storm' => 'thunderstorm',
+            'mar' => 'ocean',
+            'olas' => 'ocean',
+            'waves' => 'ocean',
+            'fuego' => 'fireplace',
+            'chimenea' => 'fireplace',
+            'fire' => 'fireplace',
+            'bosque' => 'forest',
+            'agua' => 'running_water',
+            'arroyo' => 'running_water',
+            'river' => 'running_water',
+            'stream' => 'running_water',
+            'ruido_blanco' => 'white_noise',
+            'noise' => 'white_noise',
+        ];
+        foreach ($aliases as $word => $presetKey) {
+            if (str_contains($norm, $word) && isset(self::SOUND_PRESETS[$presetKey])) {
+                return self::SOUND_PRESETS[$presetKey] + ['key' => $presetKey];
+            }
+        }
+        return null;
+    }
+
+    public function launchApp(string $appKeyOrId): array
+    {
+        $norm = strtolower(trim(str_replace(['-', ' '], '_', $appKeyOrId)));
+        $appId = self::KNOWN_APPS[$norm]['appId'] ?? strtoupper(trim($appKeyOrId));
+        if (!preg_match('/^[A-Z0-9]{8}$/', $appId)) {
+            throw new InvalidArgumentException("Unknown Cast app '{$appKeyOrId}'. Try YouTube, YouTube Music, Spotify, Netflix, or an 8-char Cast App ID.");
+        }
+
+        $launchRid = $this->nextReqId();
+        $this->send($this->senderId, 'receiver-0', self::NS_RECEIVER, [
+            'type' => 'LAUNCH',
+            'appId' => $appId,
+            'requestId' => $launchRid
+        ]);
+
+        $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 8.0);
+        return $this->getMediaState($launchReply['status'] ?? null, true);
+    }
+
+    public function loadMedia(
+        string $streamUrl,
+        string $contentType,
+        string $title = 'Treva Live Cast',
+        string $subtitle = 'Screen & Sound',
+        array $opts = []
+    ): array {
         $transportId = $this->ensureDefaultMediaReceiver(false);
-        $reply = $this->sendLoad($transportId, $streamUrl, $contentType, $title, $subtitle);
+        $reply = $this->sendLoad($transportId, $streamUrl, $contentType, $title, $subtitle, $opts);
 
         // If stale receiver session rejected LOAD, relaunch a clean DefaultMediaReceiver and retry once
         if (in_array($reply['type'] ?? '', ['LOAD_FAILED', 'INVALID_REQUEST'], true)) {
             $this->stopCurrentApp();
             usleep(250000);
             $transportId = $this->ensureDefaultMediaReceiver(true);
-            $reply = $this->sendLoad($transportId, $streamUrl, $contentType, $title, $subtitle);
+            $reply = $this->sendLoad($transportId, $streamUrl, $contentType, $title, $subtitle, $opts);
         }
 
         if (in_array($reply['type'] ?? '', ['LOAD_FAILED', 'INVALID_REQUEST'], true)) {
@@ -506,30 +683,306 @@ class CastV2
         return $transportId;
     }
 
-    private function sendLoad(string $transportId, string $streamUrl, string $contentType, string $title, string $subtitle): array
-    {
+    private function sendLoad(
+        string $transportId,
+        string $streamUrl,
+        string $contentType,
+        string $title,
+        string $subtitle,
+        array $opts = []
+    ): array {
         $isAudio = str_starts_with($contentType, 'audio/');
+        $streamType = !empty($opts['streamType']) ? strtoupper((string)$opts['streamType']) : 'LIVE';
+        $currentTime = isset($opts['currentTime']) ? max(0.0, (float)$opts['currentTime']) : 0;
+        $meta = [
+            'type' => 0,
+            'metadataType' => $isAudio ? 3 : 1,
+            'title' => $title,
+            'subtitle' => $subtitle,
+            'artist' => $subtitle
+        ];
+        if (!empty($opts['album'])) {
+            $meta['albumName'] = (string)$opts['album'];
+        }
+        if (!empty($opts['imageUrl'])) {
+            $meta['images'] = [['url' => (string)$opts['imageUrl']]];
+        }
+
         $loadRid = $this->nextReqId();
         $this->send($this->senderId, $transportId, self::NS_MEDIA, [
             'type' => 'LOAD',
             'requestId' => $loadRid,
             'autoplay' => true,
-            'currentTime' => 0,
+            'currentTime' => $currentTime,
             'media' => [
                 'contentId' => $streamUrl,
                 'contentType' => $contentType,
-                'streamType' => 'LIVE',
-                'metadata' => [
-                    'type' => 0,
-                    'metadataType' => $isAudio ? 3 : 1,
-                    'title' => $title,
-                    'subtitle' => $subtitle,
-                    'artist' => $subtitle
-                ]
+                'streamType' => $streamType,
+                'metadata' => $meta
             ]
         ]);
 
         return $this->waitForMediaReply($loadRid, 8.0);
+    }
+
+    /**
+     * Load a multi-track audio/video queue (album or playlist) into Default Media Receiver via QUEUE_LOAD.
+     */
+    public function loadMediaQueue(array $tracks, string $repeatMode = 'REPEAT_OFF'): array
+    {
+        if (empty($tracks)) {
+            throw new InvalidArgumentException('Cannot load an empty media queue.');
+        }
+        if (count($tracks) === 1) {
+            $t = $tracks[0];
+            return $this->loadMedia(
+                (string)$t['url'],
+                (string)($t['contentType'] ?? 'audio/mpeg'),
+                (string)($t['title'] ?? 'Track 1'),
+                (string)($t['artist'] ?? 'Google Cast'),
+                [
+                    'streamType' => $t['streamType'] ?? 'BUFFERED',
+                    'album' => $t['album'] ?? '',
+                    'imageUrl' => $t['imageUrl'] ?? ''
+                ]
+            );
+        }
+
+        $queueItems = [];
+        foreach (array_values($tracks) as $idx => $t) {
+            $url = trim((string)($t['url'] ?? ''));
+            if ($url === '') continue;
+            $cType = trim((string)($t['contentType'] ?? 'audio/mpeg')) ?: 'audio/mpeg';
+            $isAudio = str_starts_with($cType, 'audio/');
+            $meta = [
+                'type' => 0,
+                'metadataType' => $isAudio ? 3 : 1,
+                'title' => (string)($t['title'] ?? ('Track ' . ($idx + 1))),
+                'subtitle' => (string)($t['artist'] ?? ''),
+                'artist' => (string)($t['artist'] ?? ''),
+                'albumName' => (string)($t['album'] ?? '')
+            ];
+            if (!empty($t['imageUrl'])) {
+                $meta['images'] = [['url' => (string)$t['imageUrl']]];
+            }
+            $queueItems[] = [
+                'autoplay' => true,
+                'preloadTime' => 4,
+                'media' => [
+                    'contentId' => $url,
+                    'contentType' => $cType,
+                    'streamType' => (string)($t['streamType'] ?? 'BUFFERED'),
+                    'metadata' => $meta
+                ]
+            ];
+        }
+
+        if (empty($queueItems)) {
+            throw new RuntimeException('No playable stream URLs in media queue.');
+        }
+
+        $transportId = $this->ensureDefaultMediaReceiver(false);
+        $rid = $this->nextReqId();
+        $this->send($this->senderId, $transportId, self::NS_MEDIA, [
+            'type' => 'QUEUE_LOAD',
+            'requestId' => $rid,
+            'startIndex' => 0,
+            'repeatMode' => $repeatMode,
+            'items' => $queueItems
+        ]);
+        $reply = $this->waitForMediaReply($rid, 8.0);
+
+        if (in_array($reply['type'] ?? '', ['LOAD_FAILED', 'INVALID_REQUEST', 'INVALID_PLAYER_STATE'], true)) {
+            $this->stopCurrentApp();
+            usleep(250000);
+            $transportId = $this->ensureDefaultMediaReceiver(true);
+            $rid = $this->nextReqId();
+            $this->send($this->senderId, $transportId, self::NS_MEDIA, [
+                'type' => 'QUEUE_LOAD',
+                'requestId' => $rid,
+                'startIndex' => 0,
+                'repeatMode' => $repeatMode,
+                'items' => $queueItems
+            ]);
+            $reply = $this->waitForMediaReply($rid, 8.0);
+        }
+
+        return $reply;
+    }
+
+    /**
+     * Launch the native YouTube Cast Receiver (233637DE), negotiate an MDX screenId over CastV2,
+     * bind a YouTube Lounge session in pure PHP cURL, and start playing a video or album playlist.
+     */
+    public function playYouTubeMdx(array $videoIds, string $listId = ''): array
+    {
+        $cleanIds = array_values(array_filter(array_map('trim', $videoIds), static fn($v) => preg_match('/^[a-zA-Z0-9_-]{11}$/', $v) === 1));
+        if (empty($cleanIds)) {
+            throw new InvalidArgumentException('At least one valid 11-character YouTube videoId is required.');
+        }
+
+        $status = $this->getStatus();
+        $transportId = '';
+        foreach (($status['applications'] ?? []) as $app) {
+            if (($app['appId'] ?? '') === '233637DE' && !empty($app['transportId'])) {
+                $transportId = (string)$app['transportId'];
+                break;
+            }
+        }
+
+        if ($transportId === '') {
+            $launchRid = $this->nextReqId();
+            $this->send($this->senderId, 'receiver-0', self::NS_RECEIVER, [
+                'type' => 'LAUNCH',
+                'appId' => '233637DE',
+                'requestId' => $launchRid
+            ]);
+            $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 8.0);
+            foreach (($launchReply['status']['applications'] ?? []) as $app) {
+                if (($app['appId'] ?? '') === '233637DE' && !empty($app['transportId'])) {
+                    $transportId = (string)$app['transportId'];
+                    break;
+                }
+            }
+        }
+
+        if ($transportId === '') {
+            throw new RuntimeException('Could not launch YouTube receiver (233637DE) on Cast device.');
+        }
+
+        $this->connectTransport($transportId);
+        $this->send($this->senderId, $transportId, 'urn:x-cast:com.google.youtube.mdx', [
+            'type' => 'getMdxSessionStatus',
+            'requestId' => $this->nextReqId()
+        ]);
+
+        $screenId = '';
+        $deadline = microtime(true) + 4.5;
+        while (microtime(true) < $deadline) {
+            $msg = $this->readMessage(max(0.2, $deadline - microtime(true)));
+            if (!$msg) continue;
+            if ($msg['namespace'] === self::NS_HEARTBEAT && ($msg['data']['type'] ?? '') === 'PING') {
+                $this->send($this->senderId, 'receiver-0', self::NS_HEARTBEAT, ['type' => 'PONG']);
+                continue;
+            }
+            if (($msg['namespace'] ?? '') === 'urn:x-cast:com.google.youtube.mdx') {
+                $screenId = (string)($msg['data']['data']['screenId'] ?? '');
+                if ($screenId !== '') break;
+            }
+        }
+
+        if ($screenId === '') {
+            throw new RuntimeException('Cast device did not provide a YouTube MDX screenId.');
+        }
+
+        // Close the CastV2 socket before running external YouTube Lounge HTTP requests so the
+        // Cast TLS connection never times out or drops while waiting on cURL.
+        $this->close();
+
+        $ch = curl_init('https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => http_build_query(['screen_ids' => $screenId]),
+            CURLOPT_TIMEOUT => 8,
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+        ]);
+        $lRaw = (string)curl_exec($ch);
+        curl_close($ch);
+        $lData = json_decode($lRaw, true);
+        $loungeToken = (string)($lData['screens'][0]['loungeToken'] ?? '');
+        if ($loungeToken === '') {
+            throw new RuntimeException('Could not obtain YouTube Lounge token for screenId.');
+        }
+
+        $bindParams = [
+            'device' => 'REMOTE_CONTROL',
+            'id' => 'treva-cast-remote',
+            'name' => 'Treva Smart Hub',
+            'mdx-version' => 3,
+            'loungeIdToken' => $loungeToken,
+            'VER' => 8,
+            'v' => 2,
+            'RID' => random_int(10000, 89999),
+            'CVER' => 1,
+            'zx' => bin2hex(random_bytes(6)),
+            't' => 1
+        ];
+        $ch1 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($bindParams));
+        curl_setopt_array($ch1, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/x-www-form-urlencoded',
+                'X-YouTube-LoungeId-Token: ' . $loungeToken
+            ],
+            CURLOPT_POSTFIELDS => http_build_query(['count' => 0]),
+            CURLOPT_TIMEOUT => 8,
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+        ]);
+        $raw1 = (string)curl_exec($ch1);
+        curl_close($ch1);
+
+        $sid = '';
+        $gsession = '';
+        if (preg_match('/\["c","([^"]+)"/', $raw1, $m1)) $sid = $m1[1];
+        if (preg_match('/\["S","([^"]+)"/', $raw1, $m2)) $gsession = $m2[1];
+        if ($sid === '' || $gsession === '') {
+            throw new RuntimeException('Failed to bind YouTube Lounge session.');
+        }
+
+        $cmdParams = $bindParams;
+        $cmdParams['SID'] = $sid;
+        $cmdParams['gsessionid'] = $gsession;
+        $cmdParams['RID'] = $bindParams['RID'] + 1;
+        $cmdParams['AID'] = 1;
+
+        $postData = [
+            'count' => 1,
+            'ofs' => 0,
+            'req0__sc' => 'setPlaylist',
+            'req0_videoId' => $cleanIds[0],
+            'req0_videoIds' => implode(',', array_slice($cleanIds, 0, 25)),
+            'req0_currentTime' => 0,
+            'req0_currentIndex' => 0
+        ];
+        if ($listId !== '') {
+            $postData['req0_listId'] = $listId;
+        }
+
+        $ch2 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($cmdParams));
+        curl_setopt_array($ch2, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/x-www-form-urlencoded',
+                'X-YouTube-LoungeId-Token: ' . $loungeToken
+            ],
+            CURLOPT_POSTFIELDS => http_build_query($postData),
+            CURLOPT_TIMEOUT => 8,
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+        ]);
+        curl_exec($ch2);
+        curl_close($ch2);
+
+        $state = ['app' => null, 'mediaSession' => null];
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            usleep($attempt === 0 ? 1500000 : 1000000);
+            try {
+                $this->close();
+                if ($this->lastHost !== '') {
+                    $this->connect($this->lastHost, $this->lastPort, $this->lastTimeout);
+                    $state = $this->getMediaState(null, true);
+                    $ps = strtoupper((string)($state['mediaSession']['playerState'] ?? ''));
+                    if (in_array($ps, ['PLAYING', 'BUFFERING'], true)) {
+                        return $state;
+                    }
+                }
+            } catch (Throwable $e) {
+                // Retry on next attempt
+            }
+        }
+        return $state;
     }
 
     private function nextReqId(): int

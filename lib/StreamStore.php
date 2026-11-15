@@ -8,12 +8,14 @@ class StreamStore
 {
     private string $baseDir;
     private string $settingsFile;
+    private string $castDevicesFile;
     private array $memoryVault;
 
     public function __construct(?string $baseDir = null)
     {
         $this->baseDir = $baseDir ?: dirname(__DIR__) . DIRECTORY_SEPARATOR . 'data';
         $this->settingsFile = $this->baseDir . DIRECTORY_SEPARATOR . 'settings.json';
+        $this->castDevicesFile = $this->baseDir . DIRECTORY_SEPARATOR . 'cast_devices.json';
         $this->memoryVault = self::defaultVault();
         if (!is_dir($this->baseDir)) {
             @mkdir($this->baseDir, 0775, true);
@@ -35,6 +37,12 @@ class StreamStore
                 'password' => '',
                 'token' => '',
                 'region' => 'us'
+            ],
+            'googleNest' => [
+                'projectId' => '',
+                'clientId' => '',
+                'clientSecret' => '',
+                'refreshToken' => ''
             ],
             'openai' => [
                 'apiKey' => '',
@@ -138,7 +146,7 @@ class StreamStore
         $defaults = self::defaultVault();
         $rawCfg = self::defaultSmartConfigRaw();
         $inCfg = is_array($incoming['smartConfig'] ?? null) ? $incoming['smartConfig'] : [];
-        foreach (['tuya', 'magicHome', 'openai'] as $sec) {
+        foreach (['tuya', 'magicHome', 'googleNest', 'openai'] as $sec) {
             if (isset($inCfg[$sec]) && is_array($inCfg[$sec])) {
                 foreach ($rawCfg[$sec] as $k => $defVal) {
                     if (array_key_exists($k, $inCfg[$sec])) {
@@ -184,14 +192,14 @@ class StreamStore
             ];
         }
 
-        $devices = [];
+        $devices = $this->readDiskCastDevices();
         if (isset($incoming['devices']) && is_array($incoming['devices'])) {
             foreach ($incoming['devices'] as $k => $dev) {
                 if (!is_array($dev)) continue;
                 $id = trim((string)($dev['id'] ?? $k));
                 if ($id === '') continue;
                 $dev['id'] = $id;
-                $devices[$id] = $dev;
+                $devices[$id] = array_merge($devices[$id] ?? [], $dev);
             }
         }
 
@@ -210,6 +218,7 @@ class StreamStore
     public function clearSessionVault(): void
     {
         $this->memoryVault = self::defaultVault();
+        @unlink($this->castDevicesFile);
         if (session_status() === PHP_SESSION_ACTIVE) {
             $_SESSION['treva_vault'] = $this->memoryVault;
             unset($_SESSION['treva_tuya_tokens']);
@@ -333,10 +342,44 @@ class StreamStore
         });
     }
 
+    private function readDiskCastDevices(): array
+    {
+        return $this->withJsonLock('cast_devices', false, function () {
+            $data = $this->readJsonFileRaw($this->castDevicesFile);
+            if (!is_array($data)) return [];
+            $out = [];
+            foreach ($data as $k => $dev) {
+                if (!is_array($dev)) continue;
+                $id = trim((string)($dev['id'] ?? $k));
+                if ($id === '') continue;
+                $dev['id'] = $id;
+                $out[$id] = $dev;
+            }
+            return $out;
+        });
+    }
+
+    private function writeDiskCastDevices(array $devicesById): void
+    {
+        $this->withJsonLock('cast_devices', true, function () use ($devicesById) {
+            $this->writeJsonFileRaw($this->castDevicesFile, $devicesById);
+        });
+    }
+
     public function getDevices(): array
     {
         $v = $this->readVault();
-        return is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        $mem = is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        if (!empty($mem)) {
+            return $mem;
+        }
+        $disk = $this->readDiskCastDevices();
+        if (!empty($disk)) {
+            $v['devices'] = $disk;
+            $this->writeVault($v);
+            return $disk;
+        }
+        return [];
     }
 
     public function saveDevices(array $devicesById): array
@@ -345,13 +388,16 @@ class StreamStore
         $v['devices'] = $devicesById;
         $v['hydrated'] = true;
         $this->writeVault($v);
+        $this->writeDiskCastDevices($devicesById);
         return $devicesById;
     }
 
     public function mergeDiscoveredDevices(array $discoveredList): array
     {
         $v = $this->readVault();
-        $existing = is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        $existing = is_array($v['devices'] ?? null) && !empty($v['devices'])
+            ? $v['devices']
+            : $this->readDiskCastDevices();
         $now = time();
 
         foreach ($existing as $id => &$dev) {
@@ -376,17 +422,21 @@ class StreamStore
         $v['devices'] = $existing;
         $v['hydrated'] = true;
         $this->writeVault($v);
+        $this->writeDiskCastDevices($existing);
         return $existing;
     }
 
     public function updateDevice(string $id, array $patch): ?array
     {
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
+            ? $v['devices']
+            : $this->readDiskCastDevices();
         if (!isset($devices[$id])) return null;
         $devices[$id] = array_merge($devices[$id], $patch);
         $v['devices'] = $devices;
         $this->writeVault($v);
+        $this->writeDiskCastDevices($devices);
         return $devices[$id];
     }
 
@@ -398,7 +448,9 @@ class StreamStore
         }
         $id = 'manual-' . preg_replace('/[^a-zA-Z0-9_.-]/', '-', $host) . '-' . $port;
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
+            ? $v['devices']
+            : $this->readDiskCastDevices();
         $devices[$id] = [
             'id' => $id,
             'name' => trim($name) !== '' ? trim($name) : "Google Nest ({$host})",
@@ -419,16 +471,20 @@ class StreamStore
         $v['devices'] = $devices;
         $v['hydrated'] = true;
         $this->writeVault($v);
+        $this->writeDiskCastDevices($devices);
         return $devices[$id];
     }
 
     public function removeDevice(string $id): void
     {
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
+            ? $v['devices']
+            : $this->readDiskCastDevices();
         unset($devices[$id]);
         $v['devices'] = $devices;
         $this->writeVault($v);
+        $this->writeDiskCastDevices($devices);
     }
 
     // =========================================================================
@@ -780,6 +836,7 @@ class StreamStore
         return [
             'tuya' => array_merge($defaults['tuya'], is_array($data['tuya'] ?? null) ? $data['tuya'] : []),
             'magicHome' => array_merge($defaults['magicHome'], is_array($data['magicHome'] ?? null) ? $data['magicHome'] : []),
+            'googleNest' => array_merge($defaults['googleNest'], is_array($data['googleNest'] ?? null) ? $data['googleNest'] : []),
             'openai' => array_merge($defaults['openai'], is_array($data['openai'] ?? null) ? $data['openai'] : [])
         ];
     }
@@ -816,6 +873,13 @@ class StreamStore
                 'hasPassword' => $cfg['magicHome']['password'] !== '',
                 'hasToken' => $cfg['magicHome']['token'] !== '',
                 'region' => $cfg['magicHome']['region']
+            ],
+            'googleNest' => [
+                'configured' => ($cfg['googleNest']['projectId'] ?? '') !== '' && ($cfg['googleNest']['clientId'] ?? '') !== '',
+                'projectId' => $cfg['googleNest']['projectId'] ?? '',
+                'clientId' => $cfg['googleNest']['clientId'] ?? '',
+                'hasClientSecret' => ($cfg['googleNest']['clientSecret'] ?? '') !== '',
+                'hasRefreshToken' => ($cfg['googleNest']['refreshToken'] ?? '') !== ''
             ],
             'openai' => [
                 'configured' => $hasSessionKey || $hasServerKey,
@@ -885,6 +949,21 @@ class StreamStore
             if ($mhEmailTrimmed === '' && trim((string)($patch['magicHome']['password'] ?? '')) === '' && $explicitToken === '') {
                 $cur['magicHome']['password'] = '';
                 $cur['magicHome']['token'] = '';
+            }
+        }
+
+        if (isset($patch['googleNest']) && is_array($patch['googleNest'])) {
+            if (!isset($cur['googleNest']) || !is_array($cur['googleNest'])) {
+                $cur['googleNest'] = self::defaultSmartConfigRaw()['googleNest'];
+            }
+            foreach ($patch['googleNest'] as $k => $vItem) {
+                $val = trim((string)$vItem);
+                if (($k === 'clientSecret' || $k === 'refreshToken') && $val === $mask) {
+                    continue;
+                }
+                if (array_key_exists($k, $cur['googleNest'])) {
+                    $cur['googleNest'][$k] = $val;
+                }
             }
         }
 

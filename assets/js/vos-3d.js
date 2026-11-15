@@ -2760,7 +2760,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
         forceStandby: Boolean(vacDev),
         subtitle: vacCleaning ? `CLEANING • ${vacDev?.battery ?? '--'}%` : (vacReturning ? `RETURNING • ${vacDev?.battery ?? '--'}%` : `DOCKED • ${vacDev?.battery ?? '--'}%`),
         shortMetric: (pct, u) => `${vacCleaning ? 'CLEAN' : (vacReturning ? 'DOCKING' : 'DOCKED')} • ${vacDev?.battery ?? '--'}% • ${formatDurationSec(u.activeSec)}`,
-        detailMetric: (pct, u) => `${pct}% load • ${vacDev?.name || 'Vacuum'} (${vacDev?.vacuumMode || 'idle'}) • Bat ${vacDev?.battery ?? '--'}% • ${u.count} cmds`
+        detailMetric: (pct, u) => `${pct}% load • ${vacDev?.name || 'Sh7p'} (${vacDev?.vacuumMode || 'idle'}) • Bat ${vacDev?.battery ?? '--'}% • ${u.count} cmds`
       }),
       buildEntry('cast', 'Media Cast Bus', castLive, [0.18, 0.66, 0.88], [0.12, 0.90, 1.0], {
         forceActive: streaming || captureActive || playingCasts.length > 0 || sdkActive || btActive,
@@ -3704,7 +3704,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       if (lampHit) return lampHit;
     }
 
-    if (/\b(ceiling|techo|magic home)\b/.test(norm)) {
+    if (/\b(cielo|ceiling|techo|magic home)\b/.test(norm)) {
       const mh = devs.find((d) => d.platform === 'magichome');
       if (mh) return mh;
     }
@@ -3712,15 +3712,15 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       const ac = devs.find((d) => d.category === 'ir_ac');
       if (ac) return ac;
     }
-    if (/\b(parlante|speaker|speakers|audio|loudspeaker)\b/.test(norm)) {
+    if (/\b(edifier|parlante|speaker|speakers|audio|loudspeaker)\b/.test(norm)) {
       const aud = devs.find((d) => d.category === 'ir_audio');
       if (aud) return aud;
     }
-    if (/\b(vacuum|robot|aspiradora)\b/.test(norm)) {
+    if (/\b(vacuum|robot|aspiradora|sh7p)\b/.test(norm)) {
       const vac = devs.find((d) => d.category === 'vacuum');
       if (vac) return vac;
     }
-    if (/\b(purifier|purificador)\b/.test(norm)) {
+    if (/\b(purifier|purificador|r312)\b/.test(norm)) {
       const pur = devs.find((d) => d.category === 'ir_purifier');
       if (pur) return pur;
     }
@@ -3802,7 +3802,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       targetIds = lightDevs.map((d) => d.id);
       primaryDev = lightDevs[0] || null;
     } else {
-      const lookup = args.target || args.scene_name || (toolName === 'control_robot_vacuum' ? 'vacuum' : '');
+      const lookup = args.target || args.scene_name || (toolName === 'control_robot_vacuum' ? 'Sh7p' : '');
       primaryDev = findDeviceMatchByTarget(lookup);
       if (primaryDev) targetIds = [primaryDev.id];
     }
@@ -5710,22 +5710,38 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
             b.addEventListener('click', () => triggerDeviceControl(dev, { vacuum_action: b.dataset.vac }));
           });
         } else if (dev._kind === 'cast') {
-          const m = dev.media && dev.media.mediaSessionId ? dev.media : null;
+          const m = dev.media && (dev.media.mediaSessionId !== undefined || dev.media.title) ? dev.media : null;
           const mState = m ? String(m.playerState || '').toUpperCase() : '';
           const mPlaying = mState === 'PLAYING' || mState === 'BUFFERING';
           els.smControls.innerHTML = `
             <div class="vos-insp-row">
-              <span class="vos-insp-hex">${m ? `${escapeHtml(dev.appName || 'CAST')} • ${escapeHtml(mState)}` : (dev.appName ? `${escapeHtml(dev.appName)} OPEN` : 'CAST TARGET')} &bull; Vol ${dev.brightness ?? 0}%</span>
+              <span class="vos-insp-hex">${m ? `${escapeHtml(dev.appName || 'CAST')} • ${escapeHtml(mState)}` : (dev.appName ? `${escapeHtml(dev.appName)} OPEN` : 'CAST READY')} &bull; Vol ${dev.brightness ?? 0}%</span>
             </div>
-            ${m ? `
+            ${m ? `<div class="vos-insp-row"><span class="vos-insp-hex">${escapeHtml(m.title || 'Playing')}${m.artist ? ` — ${escapeHtml(m.artist)}` : ''}</span></div>` : ''}
+            <div class="vos-insp-row">
+              <label class="vos-insp-lbl">Volume <input type="range" id="vosSmCastVolRange" min="0" max="100" value="${dev.brightness ?? 50}" /></label>
+            </div>
             <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:6px;">
-              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="previous">Prev</button>
-              <button type="button" class="btn btn-sm btn-primary vos-sm-cast-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
-              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="next">Next</button>
-            </div>` : ''}
+              ${m ? `
+                <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="previous">Prev</button>
+                <button type="button" class="btn btn-sm btn-primary vos-sm-cast-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
+                <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="next">Next</button>
+                <button type="button" class="btn btn-sm btn-danger vos-sm-cast-btn" data-action="stop_media">Stop</button>
+              ` : ''}
+              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="play_preset" data-preset="country_night">Country Night</button>
+              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="play_preset" data-preset="rain">Rain</button>
+              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="sync_status">Sync</button>
+            </div>
           `;
+          const volR = el('vosSmCastVolRange');
+          if (volR) {
+            volR.addEventListener('change', () => triggerDeviceControl(dev, { volume: Number(volR.value) }));
+          }
           els.smControls.querySelectorAll('.vos-sm-cast-btn').forEach((b) => {
-            b.addEventListener('click', () => triggerDeviceControl(dev, { media_action: b.dataset.action }));
+            b.addEventListener('click', () => triggerDeviceControl(dev, {
+              media_action: b.dataset.action,
+              preset: b.dataset.preset || undefined
+            }));
           });
         } else {
           els.smControls.innerHTML = '';
@@ -5894,22 +5910,30 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
         </div>
       `;
     } else if (dev._kind === 'cast') {
-      const m = dev.media && dev.media.mediaSessionId ? dev.media : null;
+      const m = dev.media && (dev.media.mediaSessionId !== undefined || dev.media.title) ? dev.media : null;
       const mState = m ? String(m.playerState || '').toUpperCase() : '';
       const mPlaying = mState === 'PLAYING' || mState === 'BUFFERING';
       actionsHtml = `
         <div class="vos-insp-row">
           <span class="vos-insp-hex">${m ? `${escapeHtml(dev.appName || 'CAST')} • ${escapeHtml(mState)}` : (dev.appName ? `${escapeHtml(dev.appName)} OPEN` : (dev.power ? 'CASTING AUDIO/VIDEO' : 'CAST READY'))} &bull; Volume ${dev.brightness}%</span>
         </div>
-        ${m ? `
-        <div class="vos-insp-row"><span class="vos-insp-hex">${escapeHtml(m.title || 'Untitled')}${m.artist ? ` — ${escapeHtml(m.artist)}` : ''}</span></div>
-        <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;">
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="previous">Prev</button>
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="rewind" data-seconds="10">-10s</button>
-          <button type="button" class="btn btn-sm btn-primary vos-cast-media-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="fast_forward" data-seconds="10">+10s</button>
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="next">Next</button>
-        </div>` : ''}
+        ${m ? `<div class="vos-insp-row"><span class="vos-insp-hex">${escapeHtml(m.title || 'Playing')}${m.artist ? ` — ${escapeHtml(m.artist)}` : ''}</span></div>` : ''}
+        <div class="vos-insp-row">
+          <label class="vos-insp-lbl">Vol <input type="range" id="vosInspCastVolRange" min="0" max="100" value="${dev.brightness ?? 50}" /></label>
+        </div>
+        <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:5px;">
+          ${m ? `
+            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="previous">Prev</button>
+            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="rewind" data-seconds="10">-10s</button>
+            <button type="button" class="btn btn-sm btn-primary vos-cast-media-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
+            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="fast_forward" data-seconds="10">+10s</button>
+            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="next">Next</button>
+            <button type="button" class="btn btn-sm btn-danger vos-cast-media-btn" data-action="stop_media">Stop</button>
+          ` : ''}
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="play_preset" data-preset="country_night">Country Night</button>
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="play_preset" data-preset="rain">Rain</button>
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="sync_status">Sync</button>
+        </div>
       `;
     }
 
@@ -5952,10 +5976,13 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     }
     const dockBtn = el('vosInspDockBtn');
     if (dockBtn) dockBtn.addEventListener('click', () => triggerDeviceControl(dev, { vacuum_action: 'dock' }));
+    const castVolEl = el('vosInspCastVolRange');
+    if (castVolEl) castVolEl.addEventListener('change', () => triggerDeviceControl(dev, { volume: Number(castVolEl.value) }));
     els.inspectorBody.querySelectorAll('.vos-cast-media-btn').forEach((b) => {
       b.addEventListener('click', () => triggerDeviceControl(dev, {
         media_action: b.dataset.action,
-        seconds: b.dataset.seconds ? Number(b.dataset.seconds) : null
+        seconds: b.dataset.seconds ? Number(b.dataset.seconds) : null,
+        preset: b.dataset.preset || undefined
       }));
     });
   }
