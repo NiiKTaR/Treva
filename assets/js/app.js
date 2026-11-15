@@ -106,7 +106,12 @@
     if (!vault || typeof vault !== 'object') return;
     const mode = getLocalCacheMode();
     try {
-      const serialized = JSON.stringify(vault);
+      // Never persist physical Cast devices across browser closes in localStorage so moving to
+      // another smart home starts clean and discovers active devices in that home.
+      const toStore = mode === 'session'
+        ? vault
+        : { ...vault, devices: [] };
+      const serialized = JSON.stringify(toStore);
       if (mode === 'session') {
         if (window.sessionStorage) window.sessionStorage.setItem(TAB_VAULT_KEY, serialized);
         if (window.localStorage) window.localStorage.removeItem(LOCAL_VAULT_KEY);
@@ -184,13 +189,16 @@
   async function hydrateServerSession(vault, silent = true) {
     if (!hasMeaningfulVault(vault)) return null;
     if (hydratePromise) return hydratePromise;
+    const sanitizedVault = getLocalCacheMode() === 'session'
+      ? vault
+      : { ...vault, devices: [] };
     hydratePromise = (async () => {
       try {
         const res = await fetch(apiUrl('session_hydrate'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
-          body: JSON.stringify({ vault })
+          body: JSON.stringify({ vault: sanitizedVault })
         });
         const data = await res.json();
         if (!res.ok || data.error) {
@@ -331,8 +339,12 @@
   const smartDevicesGrid = document.getElementById('smartDevicesGrid');
   const smartCastHubSection = document.getElementById('smartCastHubSection');
   const smartCastHubMeta = document.getElementById('smartCastHubMeta');
+  const smartTabDiagBtn = document.getElementById('smartTabDiagBtn');
   const smartTabScanCastBtn = document.getElementById('smartTabScanCastBtn');
+  const smartTabDiagBox = document.getElementById('smartTabDiagBox');
   const smartCastHubList = document.getElementById('smartCastHubList');
+  const runNetDiagBtn = document.getElementById('runNetDiagBtn');
+  const castTabDiagBox = document.getElementById('castTabDiagBox');
 
   // Smart Keys Modal
   const smartKeysModal = document.getElementById('smartKeysModal');
@@ -425,7 +437,12 @@
   const toastContainer = document.getElementById('toastContainer');
 
   const LAN_BRIDGE_STORAGE_KEY = 'treva_lan_bridge_url_v1';
+  const DIAG_SUBNET_STORAGE_KEY = 'treva_diag_subnet_v1';
   let localLanBridgeBase = '';
+  let lanBridgeProbeDone = false;
+  let lanBridgeReachable = false;
+  let lastLanDiagReport = null;
+  let lanDiagRunning = false;
   const LAN_BRIDGE_ACTIONS = new Set([
     'discover',
     'manual_device',
@@ -436,8 +453,22 @@
     'cast_sync',
     'cast_sync_all',
     'cast_media',
+    'smart_discover',
     'smart_scan_wifi',
+    'smart_control',
+    'smart_add_manual',
+    'smart_remove',
+    'smart_config_save',
+    'smart_scenes_sync',
+    'smart_scene_trigger',
+    'lan_diag_sync',
     'set_lan_ip',
+    'session_hydrate',
+    'ai_execute_tool',
+    'ai_session_instructions',
+    'ai_realtime_session',
+    'ai_chat',
+    'ai_tts',
     'agent_chat',
     'realtime_tool'
   ]);
@@ -455,19 +486,45 @@
     return url + '/';
   }
 
-  async function probeLocalLanBridge() {
+  function isLoopbackHttpUrl(url) {
+    return /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(String(url || ''));
+  }
+
+  async function probeLocalLanBridge(forceProbe = false) {
+    const isLocalPage = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const isHttpsPage = window.location.protocol === 'https:';
+    if (!forceProbe && lanBridgeProbeDone && !lanBridgeReachable) {
+      return null;
+    }
+
     const candidates = [];
+    let saved = '';
     try {
-      const saved = window.localStorage ? window.localStorage.getItem(LAN_BRIDGE_STORAGE_KEY) : '';
+      saved = window.localStorage ? (window.localStorage.getItem(LAN_BRIDGE_STORAGE_KEY) || '') : '';
       if (saved) candidates.push(normalizeBridgeBase(saved));
     } catch (_) {}
-    candidates.push('http://localhost/Treva/', 'http://127.0.0.1/Treva/');
+    if (isLocalPage || forceProbe) {
+      candidates.push('http://localhost/Treva/', 'http://127.0.0.1/Treva/');
+    }
 
-    const unique = Array.from(new Set(candidates.filter(Boolean)));
+    const unique = Array.from(new Set(candidates.filter(Boolean))).filter((base) => {
+      if (isHttpsPage && /^http:\/\//i.test(base) && !isLoopbackHttpUrl(base)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (unique.length === 0) {
+      lanBridgeProbeDone = true;
+      lanBridgeReachable = false;
+      localLanBridgeBase = '';
+      return null;
+    }
+
     for (const base of unique) {
       try {
         const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        const timer = ctrl ? setTimeout(() => ctrl.abort(), 1800) : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), 1600) : null;
         const res = await fetch(`${base}api.php?action=info&sid=${encodeURIComponent(STREAM_SID)}`, {
           cache: 'no-store',
           signal: ctrl ? ctrl.signal : undefined
@@ -477,11 +534,156 @@
         const info = await res.json();
         if (info && info.isLocalEnvironment) {
           localLanBridgeBase = base;
+          lanBridgeProbeDone = true;
+          lanBridgeReachable = true;
+          try {
+            const vault = readLocalVault();
+            if (hasMeaningfulVault(vault)) {
+              fetch(`${base}api.php?action=session_hydrate&sid=${encodeURIComponent(STREAM_SID)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(vault)
+              }).catch(() => {});
+            }
+          } catch (_) {}
           return info;
         }
       } catch (_) {}
     }
+
+    lanBridgeProbeDone = true;
+    lanBridgeReachable = false;
+    localLanBridgeBase = '';
+    if (!forceProbe && saved && !isLocalPage) {
+      try {
+        if (window.localStorage) window.localStorage.removeItem(LAN_BRIDGE_STORAGE_KEY);
+      } catch (_) {}
+    }
     return null;
+  }
+
+  async function detectBrowserSubnetPrefix(customSubnet = '') {
+    const cleanCustom = String(customSubnet || '').trim().replace(/\.\*|\.\d+\/\d+$/, '');
+    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(cleanCustom)) {
+      try {
+        if (window.localStorage) window.localStorage.setItem(DIAG_SUBNET_STORAGE_KEY, cleanCustom);
+      } catch (_) {}
+      return cleanCustom;
+    }
+
+    try {
+      const saved = window.localStorage ? window.localStorage.getItem(DIAG_SUBNET_STORAGE_KEY) : '';
+      if (saved && /^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(saved)) {
+        return saved;
+      }
+    } catch (_) {}
+
+    // 1. WebRTC local ICE candidate IPv4 inspection
+    if (typeof RTCPeerConnection !== 'undefined') {
+      const rtcIp = await new Promise((resolve) => {
+        let settled = false;
+        const finish = (ip) => {
+          if (!settled) {
+            settled = true;
+            resolve(ip || '');
+          }
+        };
+        const t = setTimeout(() => finish(''), 700);
+        try {
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          pc.createDataChannel('diag');
+          pc.onicecandidate = (ev) => {
+            if (!ev || !ev.candidate || !ev.candidate.candidate) {
+              if (!ev || !ev.candidate) {
+                clearTimeout(t);
+                try { pc.close(); } catch (_) {}
+                finish('');
+              }
+              return;
+            }
+            const m = /((?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1]))\.\d{1,3})\.\d{1,3}/.exec(ev.candidate.candidate);
+            if (m && m[1]) {
+              clearTimeout(t);
+              try { pc.close(); } catch (_) {}
+              finish(m[1]);
+            }
+          };
+          pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => finish(''));
+        } catch (_) {
+          clearTimeout(t);
+          finish('');
+        }
+      });
+      if (rtcIp) return rtcIp;
+    }
+
+    // 2. Check serverInfo or cached local vault device IPs
+    if (serverInfo && serverInfo.selectedLanIp) {
+      const m = /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/.exec(serverInfo.selectedLanIp);
+      if (m && m[1] !== '127.0.0') return m[1];
+    }
+    const vault = readLocalVault();
+    const allKnownIps = [
+      ...(devices || []).map((d) => d.host),
+      ...(smartDevices || []).map((d) => d.ip),
+      ...((vault && Array.isArray(vault.devices)) ? vault.devices.map((d) => d.host) : []),
+      ...((vault && Array.isArray(vault.smartDevices)) ? vault.smartDevices.map((d) => d.ip) : [])
+    ].filter(Boolean);
+    for (const ip of allKnownIps) {
+      const m = /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/.exec(String(ip));
+      if (m && m[1] !== '127.0.0') return m[1];
+    }
+
+    return '192.168.1';
+  }
+
+  async function probeLanPortTiming(ip, port, scheme = 'http', timeoutMs = 420) {
+    const start = performance.now();
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+    try {
+      await fetch(`${scheme}://${ip}:${port}/`, {
+        mode: 'no-cors',
+        cache: 'no-store',
+        signal: ctrl ? ctrl.signal : undefined
+      });
+      if (timer) clearTimeout(timer);
+      return { reachable: true, status: 'open', ms: Math.round(performance.now() - start) };
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      const elapsed = Math.round(performance.now() - start);
+      const isAbort = (err && err.name === 'AbortError') || elapsed >= timeoutMs - 25;
+      return { reachable: !isAbort && elapsed < 260, status: isAbort ? 'timeout' : 'fast_HandshakeOrReset', ms: elapsed };
+    }
+  }
+
+  async function probeHostOnLan(ip) {
+    // Compare target device ports against an unused control port on the same IP
+    const [castTls, castHttp, mhPort, ctrlPort] = await Promise.all([
+      probeLanPortTiming(ip, 8009, 'https', 420),
+      probeLanPortTiming(ip, 8008, 'http', 400),
+      probeLanPortTiming(ip, 5577, 'http', 380),
+      probeLanPortTiming(ip, 59183, 'http', 380)
+    ]);
+
+    const openPorts = [];
+    if (castHttp.status === 'open' || (castHttp.reachable && (!ctrlPort.reachable || Math.abs(castHttp.ms - ctrlPort.ms) > 18))) {
+      openPorts.push({ port: 8008, protocol: 'Cast Eureka HTTP', ms: castHttp.ms });
+    }
+    if (castTls.status === 'open' || (castTls.reachable && (!ctrlPort.reachable || Math.abs(castTls.ms - ctrlPort.ms) > 15))) {
+      openPorts.push({ port: 8009, protocol: 'CastV2 TLS', ms: castTls.ms });
+    }
+    if (mhPort.status === 'open') {
+      openPorts.push({ port: 5577, protocol: 'MagicHome TCP', ms: mhPort.ms });
+    }
+
+    const hostAlive = openPorts.length > 0 || castTls.reachable || castHttp.reachable || ctrlPort.reachable;
+    return {
+      ip,
+      hostAlive,
+      ms: Math.min(castTls.ms, castHttp.ms, ctrlPort.ms),
+      openPorts
+    };
   }
 
   function apiUrl(action, extra = '') {
@@ -595,14 +797,14 @@
   // ===========================================================================
   // SERVER INFO & BACKGROUND STATE POLLING
   // ===========================================================================
-  async function loadServerInfo() {
+  async function loadServerInfo(forceBridgeProbe = false) {
     try {
       const res = await fetch(apiUrl('info'), { cache: 'no-store' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Server error');
 
       if (!data.isLocalEnvironment) {
-        const bridgeInfo = await probeLocalLanBridge();
+        const bridgeInfo = await probeLocalLanBridge(forceBridgeProbe);
         if (bridgeInfo) {
           data.isLocalEnvironment = true;
           data.isLocalBridge = true;
@@ -691,18 +893,19 @@
         renderSmartDevices(true);
       }
 
-      if (data.isLocalEnvironment) {
-        localScanControls.classList.remove('hidden');
-        scanSmartWifiBtn.classList.remove('hidden');
-        devices = activePayload.devices || [];
-        renderDevices(true);
-        if (!devices || devices.length === 0) {
+      localScanControls.classList.remove('hidden');
+      scanSmartWifiBtn.classList.remove('hidden');
+      devices = Array.isArray(activePayload.devices) ? activePayload.devices : [];
+      renderDevices(true);
+
+      if (!devices || devices.length === 0) {
+        if (data.isLocalEnvironment) {
           discoverLocalDevices(true);
+        } else {
+          runLocalNetworkDiagnostics({ silent: true, showPanel: false });
         }
-      } else {
-        localScanControls.classList.add('hidden');
-        scanSmartWifiBtn.classList.add('hidden');
-        renderRemoteHostingNotice();
+      } else if (!data.isLocalEnvironment) {
+        runLocalNetworkDiagnostics({ silent: true, showPanel: false });
       }
       updateLocalSessionStatusUi();
       syncVosState(data.streamStatus || null);
@@ -710,30 +913,333 @@
         syncSmartScenes(true);
       }
     } catch (err) {
-      serverDot.classList.remove('online');
-      if (vosPureDot) vosPureDot.classList.add('offline');
-      serverStatusText.textContent = 'Connection Error';
+      const offlineVault = readLocalVault();
+      if (offlineVault) {
+        if (Array.isArray(offlineVault.smartDevices)) smartDevices = offlineVault.smartDevices;
+        if (offlineVault.smartScenes) smartScenes = offlineVault.smartScenes;
+        if (offlineVault.smartConfig) smartConfig = offlineVault.smartConfig;
+        renderDevices(true);
+        renderSmartDevices(true);
+        renderSmartScenes();
+      }
+      serverStatusText.textContent = navigator.onLine === false ? 'Offline Local Mode' : 'Local Diagnostic Mode';
+      runLocalNetworkDiagnostics({ silent: true, showPanel: true });
       console.error('Info error:', err);
+    }
+  }
+
+  function renderLanDiagBoxes(report) {
+    lastLanDiagReport = report;
+    const boxes = [smartTabDiagBox, castTabDiagBox].filter(Boolean);
+    if (!report) {
+      boxes.forEach((b) => b.classList.add('hidden'));
+      return;
+    }
+
+    const savedBridge = (window.localStorage && window.localStorage.getItem(LAN_BRIDGE_STORAGE_KEY)) || 'http://localhost/Treva';
+    const castSdkStatus = report.castSdkState || 'Standby';
+    const bridgeBadge = report.bridgeActive
+      ? `<span class="device-kind-tag smart-key-ok">Local Engine: ${escapeHtml(report.bridgeUrl || 'Active')}</span>`
+      : `<span class="device-kind-tag">Browser Direct Mode</span>`;
+    const pwaBadge = report.swReady
+      ? `<span class="device-kind-tag smart-key-ok">Offline PWA Ready</span>`
+      : `<span class="device-kind-tag">Web App</span>`;
+    const bleBadge = report.bleSupported
+      ? `<span class="device-kind-tag smart-key-ok">Web Bluetooth Ready</span>`
+      : `<span class="device-kind-tag">BLE N/A</span>`;
+
+    const rowsHtml = (report.endpoints || []).length > 0
+      ? report.endpoints.map((ep) => `
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:rgba(255,255,255,0.04);font-size:0.76rem;">
+            <div>
+              <strong>${escapeHtml(ep.name || ep.ip)}</strong>
+              <span style="opacity:0.75;margin-left:6px;">${escapeHtml(ep.ip)}${ep.port ? ':' + ep.port : ''}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="device-kind-tag">${escapeHtml(ep.protocol || 'LAN')}</span>
+              <span style="opacity:0.8;">${ep.ms !== undefined ? ep.ms + 'ms' : escapeHtml(ep.status || 'ONLINE')}</span>
+            </div>
+          </div>
+        `).join('')
+      : `<div style="font-size:0.76rem;opacity:0.78;padding:4px 0;">${
+          report.scanning
+            ? 'Probing local subnet ' + escapeHtml(report.subnet) + '.1–254 for Cast (:8009/:8008) &amp; MagicHome (:5577)...'
+            : 'No raw TCP responses in browser sandbox on ' + escapeHtml(report.subnet) + '.x — direct Wi-Fi Chrome Cast SDK remains available, or start local XAMPP (http://localhost/Treva).'
+        }</div>`;
+
+    const html = `
+      <div class="key-section-box" style="margin-bottom:10px;padding:10px 12px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+          <strong style="font-size:0.82rem;">Local Network Diagnostic (${escapeHtml(report.subnet || '192.168.1')}.0/24)</strong>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">
+            ${bridgeBadge}
+            <span class="device-kind-tag">Cast SDK: ${escapeHtml(castSdkStatus)}</span>
+            ${bleBadge}
+            ${pwaBadge}
+            <button type="button" class="btn btn-secondary btn-xs lan-diag-close-btn" title="Hide diagnostic panel">&times;</button>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px;">
+          ${rowsHtml}
+        </div>
+        <div class="cast-cmd-row" style="gap:6px;flex-wrap:wrap;">
+          <input type="text" class="text-input lan-diag-subnet-input" style="max-width:135px;padding:4px 8px;font-size:0.75rem;" value="${escapeHtml(report.subnet || '192.168.1')}" placeholder="192.168.1" title="Local /24 Subnet Prefix" />
+          <button type="button" class="btn btn-primary btn-xs lan-diag-rescan-btn">${report.scanning ? 'Scanning...' : 'Scan Subnet'}</button>
+          <input type="text" class="text-input lan-bridge-input" style="flex:1;min-width:160px;padding:4px 8px;font-size:0.75rem;" value="${escapeHtml(savedBridge)}" placeholder="Local Companion URL (http://localhost/Treva)" />
+          <button type="button" class="btn btn-secondary btn-xs lan-bridge-connect-btn">Link Local PHP</button>
+        </div>
+      </div>
+    `;
+
+    boxes.forEach((box) => {
+      box.classList.remove('hidden');
+      box.innerHTML = html;
+      const closeBtn = box.querySelector('.lan-diag-close-btn');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', () => {
+          boxes.forEach((b) => b.classList.add('hidden'));
+        });
+      }
+      const rescanBtn = box.querySelector('.lan-diag-rescan-btn');
+      const subnetInp = box.querySelector('.lan-diag-subnet-input');
+      if (rescanBtn && subnetInp) {
+        rescanBtn.addEventListener('click', () => {
+          runLocalNetworkDiagnostics({
+            silent: false,
+            showPanel: true,
+            customSubnet: subnetInp.value.trim()
+          });
+        });
+      }
+      const bridgeBtn = box.querySelector('.lan-bridge-connect-btn');
+      const bridgeInp = box.querySelector('.lan-bridge-input');
+      if (bridgeBtn && bridgeInp) {
+        bridgeBtn.addEventListener('click', async () => {
+          const val = bridgeInp.value.trim();
+          if (!val) {
+            try { if (window.localStorage) window.localStorage.removeItem(LAN_BRIDGE_STORAGE_KEY); } catch (_) {}
+            localLanBridgeBase = '';
+            lanBridgeReachable = false;
+            lanBridgeProbeDone = true;
+            showToast('Cleared saved local companion bridge.', 'info');
+            await loadServerInfo(false);
+            await runLocalNetworkDiagnostics({ silent: false, showPanel: true });
+            return;
+          }
+          const normalized = normalizeBridgeBase(val);
+          if (window.location.protocol === 'https:' && /^http:\/\//i.test(normalized) && !isLoopbackHttpUrl(normalized)) {
+            showToast('Chrome blocks plain http:// LAN IPs from HTTPS pages (Mixed Content). Use http://localhost/Treva or cast directly over Wi-Fi.', 'error');
+            return;
+          }
+          try {
+            if (window.localStorage) window.localStorage.setItem(LAN_BRIDGE_STORAGE_KEY, normalized);
+          } catch (_) {}
+          showToast('Probing local LAN bridge...', 'info');
+          await loadServerInfo(true);
+          if (!localLanBridgeBase) {
+            try { if (window.localStorage) window.localStorage.removeItem(LAN_BRIDGE_STORAGE_KEY); } catch (_) {}
+            showToast('Could not reach local XAMPP at ' + normalized + '. Direct Wi-Fi Cast SDK still works.', 'info');
+          } else {
+            showToast('Connected to Local LAN Bridge (' + localLanBridgeBase + ')', 'success');
+          }
+          await runLocalNetworkDiagnostics({ silent: false, showPanel: true });
+        });
+      }
+    });
+  }
+
+  async function runLocalNetworkDiagnostics(opts = {}) {
+    if (lanDiagRunning) return lastLanDiagReport;
+    lanDiagRunning = true;
+    const silent = Boolean(opts.silent);
+    const showPanel = opts.showPanel !== false;
+    try {
+      const subnet = await detectBrowserSubnetPrefix(opts.customSubnet || '');
+      const swReady = Boolean(navigator.serviceWorker && navigator.serviceWorker.controller);
+      const bleSupported = Boolean(navigator.bluetooth);
+      let castSdkState = 'Unavailable';
+      if (window.cast && window.cast.framework) {
+        try {
+          const ctx = cast.framework.CastContext.getInstance();
+          castSdkState = ctx.getCastState ? String(ctx.getCastState()) : 'Ready';
+        } catch (_) {
+          castSdkState = 'Ready';
+        }
+      }
+
+      if ((!serverInfo || !serverInfo.isLocalEnvironment) && !localLanBridgeBase) {
+        const bridgeInfo = await probeLocalLanBridge(Boolean(opts.forceBridgeProbe));
+        if (bridgeInfo && serverInfo) {
+          serverInfo.isLocalEnvironment = true;
+          serverInfo.isLocalBridge = true;
+          serverInfo.interfaces = bridgeInfo.interfaces || [];
+          serverInfo.selectedLanIp = bridgeInfo.selectedLanIp || '';
+          serverStatusText.textContent = 'PHP Hosting + Local Cast Bridge';
+        }
+      }
+
+      const bridgeActive = Boolean((serverInfo && serverInfo.isLocalEnvironment) || localLanBridgeBase);
+      const endpoints = [];
+
+      if (showPanel) {
+        renderLanDiagBoxes({
+          scanning: true,
+          subnet,
+          bridgeActive,
+          bridgeUrl: localLanBridgeBase || (serverInfo && serverInfo.isLocalEnvironment ? 'localhost' : ''),
+          castSdkState,
+          swReady,
+          bleSupported,
+          endpoints
+        });
+      }
+
+      // 1. Query server / local bridge mDNS & CastV2 if available
+      try {
+        const res = await fetch(apiUrl('discover'), { cache: 'no-store' });
+        if (res.ok) {
+          const dData = await res.json();
+          if (Array.isArray(dData.devices) && dData.devices.length > 0) {
+            devices = dData.devices;
+            persistSessionVaultFromResponse(dData);
+          }
+        }
+      } catch (_) {}
+
+      // 2. Include already known Cast & Smart Wi-Fi devices in diagnostic list
+      (devices || []).forEach((d) => {
+        if (!d || !d.host) return;
+        endpoints.push({
+          name: d.name || 'Cast Device',
+          ip: d.host,
+          port: d.port || 8009,
+          protocol: d.kind === 'display' ? 'Chromecast / TV (CastV2)' : 'Google Nest (CastV2)',
+          status: d.status || 'READY'
+        });
+      });
+      (smartDevices || []).forEach((sd) => {
+        if (!sd || !sd.ip) return;
+        endpoints.push({
+          name: sd.name || sd.id,
+          ip: sd.ip,
+          port: sd.platform === 'tuya' ? 6668 : 5577,
+          protocol: sd.platform === 'tuya' ? 'SmartLife Local TCP' : 'MagicHome Local TCP',
+          status: sd.online !== false ? 'ONLINE' : 'STANDBY'
+        });
+      });
+
+      // 3. Browser-side direct subnet port diagnostic across priority IPs on the /24 subnet
+      // Skip raw HTTP/self-signed-TLS fetch probes when running on a remote HTTPS origin to prevent
+      // browser Mixed Content / ERR_UNSAFE_PORT (6668) / ERR_CERT_AUTHORITY_INVALID console noise.
+      const isHttpsRemote = window.location.protocol === 'https:' &&
+        window.location.hostname !== 'localhost' &&
+        window.location.hostname !== '127.0.0.1';
+      const newCastFound = [];
+      const newSmartFound = [];
+
+      if (!isHttpsRemote && !silent) {
+        const knownIps = new Set(endpoints.map((e) => e.ip));
+        const candidateOctets = [7, 8, 9, 10, 11, 12, 13, 14, 15, 2, 3, 4, 5, 6, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25];
+        const probeIps = [];
+        knownIps.forEach((ip) => probeIps.push(ip));
+        candidateOctets.forEach((oct) => {
+          const ip = `${subnet}.${oct}`;
+          if (!knownIps.has(ip)) probeIps.push(ip);
+        });
+
+        const batchSize = 8;
+        for (let i = 0; i < Math.min(probeIps.length, 24); i += batchSize) {
+          const slice = probeIps.slice(i, i + batchSize);
+          const results = await Promise.all(slice.map((ip) => probeHostOnLan(ip)));
+          for (const r of results) {
+            const existing = endpoints.find((e) => e.ip === r.ip);
+            if (existing && r.ms < 400) {
+              existing.ms = r.ms;
+            }
+            if (!existing && r.openPorts.length > 0) {
+              const p0 = r.openPorts[0];
+              endpoints.push({
+                name: p0.port === 8009 || p0.port === 8008 ? `Cast Receiver (${r.ip})` : `Smart Device (${r.ip})`,
+                ip: r.ip,
+                port: p0.port,
+                protocol: p0.protocol,
+                ms: p0.ms
+              });
+              if (p0.port === 8009 || p0.port === 8008) {
+                newCastFound.push({ name: `Cast Device (${r.ip})`, host: r.ip, port: 8009, kind: 'display' });
+              } else if (p0.port === 5577) {
+                newSmartFound.push({ ip: r.ip, platform: 'magichome' });
+              }
+            }
+          }
+        }
+      }
+
+      if (newCastFound.length > 0 || newSmartFound.length > 0) {
+        try {
+          const syncRes = await fetch(apiUrl('lan_diag_sync'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ castDevices: newCastFound, smartDevices: newSmartFound })
+          });
+          if (syncRes.ok) {
+            const syncData = await syncRes.json();
+            if (Array.isArray(syncData.devices)) devices = syncData.devices;
+            if (Array.isArray(syncData.smartDevices)) smartDevices = syncData.smartDevices;
+            persistSessionVaultFromResponse(syncData);
+          }
+        } catch (_) {}
+      }
+
+      renderDevices(true);
+      renderSmartDevices(true);
+      syncVosState();
+
+      const finalReport = {
+        scanning: false,
+        subnet,
+        bridgeActive,
+        bridgeUrl: localLanBridgeBase || (serverInfo && serverInfo.isLocalEnvironment ? 'localhost' : ''),
+        castSdkState,
+        swReady,
+        bleSupported,
+        endpoints
+      };
+      if (showPanel) {
+        renderLanDiagBoxes(finalReport);
+      }
+      if (!silent) {
+        showToast(
+          endpoints.length > 0
+            ? `Network diagnostic complete: ${endpoints.length} local device endpoint(s) active on ${subnet}.0/24`
+            : `Network diagnostic complete on ${subnet}.0/24`,
+          endpoints.length > 0 ? 'success' : 'info'
+        );
+      }
+      return finalReport;
+    } finally {
+      lanDiagRunning = false;
     }
   }
 
   async function discoverLocalDevices(silent = false) {
     try {
-      if (!silent) showToast('Scanning Wi-Fi for Google Nest & Cast devices...');
+      if (!silent) showToast('Searching for active Cast devices on current Wi-Fi...');
       const res = await fetch(apiUrl('discover'), { cache: 'no-store' });
       const data = await res.json();
-      if (data.remoteHosting) {
-        renderRemoteHostingNotice();
-        return;
-      }
       if (Array.isArray(data.devices)) {
         devices = data.devices;
         renderDevices(true);
         persistSessionVaultFromResponse(data);
         syncVosState();
       }
+      if (!silent && serverInfo && !serverInfo.isLocalEnvironment && (!devices || devices.length === 0)) {
+        await pairActiveCastDeviceViaSdk();
+        return;
+      }
+      await runLocalNetworkDiagnostics({ silent, showPanel: !silent || (!devices || devices.length === 0) });
     } catch (err) {
-      if (!silent) showToast('LAN scan failed: ' + err.message, 'error');
+      await runLocalNetworkDiagnostics({ silent, showPanel: true });
     }
   }
 
@@ -1640,7 +2146,7 @@
         <p><strong>Remote Hosting Mode (No Local LAN Bridge Detected)</strong></p>
         <span class="empty-sub">Google Nest &amp; Chromecast only listen on your local home Wi-Fi (port 8009 / mDNS). Start XAMPP locally (<code>http://localhost/Treva</code>) or enter your PC's LAN bridge URL below to list and control them from this hosted page:</span>
         <div class="cast-cmd-row" style="margin-top:10px;max-width:420px;margin-left:auto;margin-right:auto;">
-          <input type="text" class="lan-bridge-input" value="${escapeHtml(savedBridge)}" placeholder="http://localhost/Treva or http://192.168.100.24/Treva" />
+          <input type="text" class="lan-bridge-input" value="${escapeHtml(savedBridge)}" placeholder="http://localhost/Treva or http://192.168.1.10/Treva" />
           <button type="button" class="btn btn-primary btn-xs lan-bridge-connect-btn">Connect LAN Bridge</button>
         </div>
       </div>
@@ -1654,15 +2160,21 @@
         btn.addEventListener('click', async () => {
           const val = inp.value.trim();
           if (!val) return;
+          const normalized = normalizeBridgeBase(val);
+          if (window.location.protocol === 'https:' && /^http:\/\//i.test(normalized) && !isLoopbackHttpUrl(normalized)) {
+            showToast('Chrome blocks plain http:// LAN IPs from HTTPS pages (Mixed Content). Use http://localhost/Treva or cast directly via Chrome Cast SDK.', 'error');
+            return;
+          }
           try {
-            if (window.localStorage) window.localStorage.setItem(LAN_BRIDGE_STORAGE_KEY, val);
+            if (window.localStorage) window.localStorage.setItem(LAN_BRIDGE_STORAGE_KEY, normalized);
           } catch (_) {}
           showToast('Probing local LAN Cast bridge...', 'info');
-          await loadServerInfo();
+          await loadServerInfo(true);
           if (localLanBridgeBase) {
             showToast('Connected to Local LAN Cast Bridge (' + localLanBridgeBase + ')', 'success');
           } else {
-            showToast('Could not reach local XAMPP bridge at ' + val + '. Make sure Apache is running.', 'error');
+            try { if (window.localStorage) window.localStorage.removeItem(LAN_BRIDGE_STORAGE_KEY); } catch (_) {}
+            showToast('Could not reach local XAMPP bridge at ' + normalized + '. You can still cast directly over Wi-Fi using Chrome Cast.', 'error');
           }
         });
       }
@@ -1961,10 +2473,6 @@
 
   function renderDevices(force = false) {
     updateSmartAndCastCounters();
-    if (serverInfo && !serverInfo.isLocalEnvironment) {
-      renderRemoteHostingNotice();
-      return;
-    }
 
     const sig = JSON.stringify(
       (devices || []).map((d) => [
@@ -1978,14 +2486,37 @@
     const targetContainers = [devicesList, smartCastHubList].filter(Boolean);
 
     if (!devices || devices.length === 0) {
+      const isRemoteNoBridge = (!serverInfo || !serverInfo.isLocalEnvironment) && !localLanBridgeBase;
       const emptyHtml = `
         <div class="empty-devices">
-          <p>No Google Nest or Chromecast devices discovered yet.</p>
-          <span class="empty-sub">Click <strong>Scan Nest / Cast</strong> or <strong>Scan Wi-Fi</strong> above, use <strong>+ Add IP</strong>, or use <strong>Select Bluetooth Speaker Output</strong>.</span>
+          <p>No active Google Nest or Chromecast devices loaded yet.</p>
+          <span class="empty-sub">${
+            isRemoteNoBridge
+              ? 'Click <strong>Pair Active Cast Device (Wi-Fi)</strong> to find &amp; select an active speaker or TV on this home\'s Wi-Fi via Chrome Cast, or link a local PHP bridge in <strong>Net Diag</strong>.'
+              : 'Click <strong>Scan Active Devices</strong> or <strong>Net Diag</strong> to search this Wi-Fi for active speakers &amp; TVs, or pair via Chrome Cast.'
+          }</span>
+          <div style="margin-top:8px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+            <button type="button" class="btn btn-primary btn-xs inline-pair-sdk-btn">Pair Active Cast Device (Wi-Fi)</button>
+            <button type="button" class="btn btn-secondary btn-xs inline-run-net-diag-btn">${isRemoteNoBridge ? 'Net Diag / Local PHP' : 'Scan Active Devices'}</button>
+          </div>
         </div>
       `;
       targetContainers.forEach((c) => {
         c.innerHTML = emptyHtml;
+        const pairBtn = c.querySelector('.inline-pair-sdk-btn');
+        if (pairBtn) {
+          pairBtn.addEventListener('click', () => pairActiveCastDeviceViaSdk());
+        }
+        const diagBtn = c.querySelector('.inline-run-net-diag-btn');
+        if (diagBtn) {
+          diagBtn.addEventListener('click', () => {
+            if (isRemoteNoBridge) {
+              runLocalNetworkDiagnostics({ silent: false, showPanel: true });
+            } else {
+              discoverLocalDevices(false);
+            }
+          });
+        }
       });
       return;
     }
@@ -2184,6 +2715,11 @@
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.ok === false) throw new Error(data.error || `Cast ${action} failed`);
+      if (data.clientAction) {
+        await executeClientActions([data.clientAction]);
+      } else if (Array.isArray(data.clientActions) && data.clientActions.length > 0) {
+        await executeClientActions(data.clientActions);
+      }
       if (data.device) {
         const idx = devices.findIndex((d) => d.id === data.device.id);
         if (idx !== -1) devices[idx] = data.device;
@@ -2223,6 +2759,60 @@
   async function handleLocalCastStart(deviceId) {
     const dev = devices.find((d) => d.id === deviceId);
     if (!dev) return;
+
+    const hasLocalPhpBridge = Boolean((serverInfo && serverInfo.isLocalEnvironment) || localLanBridgeBase);
+    if (!hasLocalPhpBridge) {
+      if (!castFrameworkReady && window.cast && window.cast.framework) {
+        initCastFramework(true);
+      }
+      if (!castFrameworkReady || !window.cast || !window.cast.framework) {
+        showToast(getCastUnavailableReason(), 'error');
+        return;
+      }
+      try {
+        const context = cast.framework.CastContext.getInstance();
+        let session = context.getCurrentSession();
+        if (!session) {
+          showToast(`Select "${dev.name}" in Chrome's Cast chooser...`, 'info');
+          await context.requestSession();
+          session = context.getCurrentSession();
+        }
+        if (!session) return;
+
+        const castDev = session.getCastDevice ? session.getCastDevice() : null;
+        const hasVideoOut =
+          castDev && Array.isArray(castDev.capabilities)
+            ? castDev.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)
+            : dev.kind !== 'speaker';
+        const effectiveMode = !hasVideoOut || dev.kind === 'speaker' ? 'audio' : streamMode;
+        if (effectiveMode !== streamMode) setStreamMode(effectiveMode, true);
+
+        if (!isCapturing) {
+          const started = await startBrowserCapture('display');
+          if (!started) return;
+        }
+
+        const finalHasVideo = Boolean(displayStream && displayStream.getVideoTracks().length > 0);
+        const castMode = effectiveMode === 'video' && finalHasVideo ? 'video' : 'audio';
+        if (castMode !== streamMode) setStreamMode(castMode, true);
+
+        const isAudio = castMode === 'audio';
+        if (isAudio && displayStream && displayStream.getAudioTracks().length === 0) {
+          showToast('No system audio track captured! Stop capture and check "Also share system audio".', 'error');
+          return;
+        }
+
+        await waitForUploadedChunk(isAudio ? 'mp3' : 'webm', 2800);
+        sdkRecoverCount = 0;
+        await loadStreamOnSdkSession(session, castMode);
+        showToast(`Streaming ${isAudio ? 'sound' : 'screen & sound'} to ${castDev ? castDev.friendlyName : dev.name}!`, 'success');
+      } catch (err) {
+        if (err && err !== 'cancel' && err.code !== 'cancel') {
+          showToast(`Cast error: ${err.message || err}`, 'error');
+        }
+      }
+      return;
+    }
 
     if (!isCapturing) {
       if (dev.kind === 'speaker' && streamMode !== 'audio') {
@@ -2269,6 +2859,12 @@
 
   async function handleLocalCastStop(deviceId) {
     try {
+      stopRawMdxSession();
+      if (activeCastSession) {
+        userStoppedSdkCast = true;
+        activeCastSession.endSession(true);
+        updateSdkUi(null);
+      }
       const res = await fetch(apiUrl('cast_stop'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2292,6 +2888,12 @@
     }
   }
 
+  if (runNetDiagBtn) {
+    runNetDiagBtn.addEventListener('click', () => runLocalNetworkDiagnostics({ silent: false, showPanel: true }));
+  }
+  if (smartTabDiagBtn) {
+    smartTabDiagBtn.addEventListener('click', () => runLocalNetworkDiagnostics({ silent: false, showPanel: true }));
+  }
   refreshDevicesBtn.addEventListener('click', () => discoverLocalDevices(false));
   addManualDeviceBtn.addEventListener('click', () => manualDeviceForm.classList.toggle('hidden'));
 
@@ -2328,6 +2930,71 @@
   // ===========================================================================
   // OFFICIAL GOOGLE CAST BROWSER SENDER SDK
   // ===========================================================================
+  let lastSdkRegisteredKey = '';
+
+  async function registerCastSdkDeviceToStore(info = {}) {
+    const cleanName = String(info.name || info.friendlyName || '').trim();
+    if (!cleanName || cleanName === 'Google Cast Device') return null;
+    const dedupKey = `${info.deviceId || ''}|${cleanName}|${info.kind || ''}|${info.mdxScreenId || ''}`;
+    const alreadyInList = (devices || []).find((d) => String(d.name || '').toLowerCase() === cleanName.toLowerCase());
+    if (dedupKey === lastSdkRegisteredKey && alreadyInList && (!info.mdxScreenId || alreadyInList.mdxScreenId === info.mdxScreenId)) {
+      return alreadyInList;
+    }
+    lastSdkRegisteredKey = dedupKey;
+    try {
+      const res = await fetch(apiUrl('register_sdk_device'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(info)
+      });
+      const data = await res.json();
+      if (res.ok && data && Array.isArray(data.devices)) {
+        devices = data.devices;
+        renderDevices(true);
+        persistSessionVaultFromResponse(data);
+        syncVosState();
+        return data.device || null;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async function pairActiveCastDeviceViaSdk() {
+    if (!castFrameworkReady && window.cast && window.cast.framework) {
+      initCastFramework(true);
+    }
+    if (!castFrameworkReady || !window.cast || !window.cast.framework) {
+      showToast(getCastUnavailableReason(), 'error');
+      return null;
+    }
+    try {
+      const context = cast.framework.CastContext.getInstance();
+      await context.requestSession();
+      const session = context.getCurrentSession();
+      if (!session) return null;
+      updateSdkUi(session);
+      const castDev = session.getCastDevice ? session.getCastDevice() : null;
+      const friendlyName = (castDev && castDev.friendlyName) || 'Google Cast Device';
+      const hasVideoOut = castDev && Array.isArray(castDev.capabilities)
+        ? castDev.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)
+        : true;
+      const reg = await registerCastSdkDeviceToStore({
+        deviceId: (castDev && castDev.deviceId) || '',
+        name: friendlyName,
+        model: (castDev && castDev.modelName) || '',
+        kind: hasVideoOut ? 'display' : 'speaker',
+        status: 'ACTIVE'
+      });
+      showToast(`Paired active device: ${friendlyName}`, 'success');
+      return reg;
+    } catch (err) {
+      if (err && err !== 'cancel' && err.code !== 'cancel') {
+        showToast(`Cast pair error: ${err.message || err}`, 'error');
+      }
+      return null;
+    }
+  }
+
   function updateSdkUi(session) {
     activeCastSession = session || null;
     if (dockCastDot) {
@@ -2342,6 +3009,19 @@
     const castDev = session.getCastDevice ? session.getCastDevice() : null;
     sdkDeviceName.textContent = (castDev && castDev.friendlyName) || 'Google Cast Device';
     sdkSessionBox.classList.remove('hidden');
+
+    if (castDev && castDev.friendlyName) {
+      const hasVideoOut = Array.isArray(castDev.capabilities)
+        ? castDev.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)
+        : true;
+      registerCastSdkDeviceToStore({
+        deviceId: castDev.deviceId || '',
+        name: castDev.friendlyName,
+        model: castDev.modelName || '',
+        kind: hasVideoOut ? 'display' : 'speaker',
+        status: 'ACTIVE'
+      });
+    }
 
     if (remotePlayer) {
       const volPct = Math.round((remotePlayer.volumeLevel || 0.7) * 100);
@@ -4121,6 +4801,8 @@
     }
   }
 
+  let lastRealtimeUserTranscript = '';
+
   function buildAiClientContext() {
     let castSdkInfo = null;
     if (activeCastSession) {
@@ -4132,6 +4814,7 @@
     }
     return {
       castSdk: castSdkInfo,
+      lastUserTranscript: lastRealtimeUserTranscript || '',
       bleDevices: (bleDevices || []).map((b) => ({
         id: b.id,
         name: b.name,
@@ -4142,6 +4825,415 @@
         b: b.b
       }))
     };
+  }
+
+  // Browser / Bluetooth Fallback Audio Queue + Chrome Cast SDK Media Bridge
+  let browserFallbackAudio = null;
+  let browserFallbackQueue = [];
+  let browserFallbackIdx = 0;
+  let pendingCastBridgeAction = null;
+
+  function ensureBrowserFallbackAudio() {
+    if (!browserFallbackAudio) {
+      browserFallbackAudio = new Audio();
+      browserFallbackAudio.crossOrigin = 'anonymous';
+      browserFallbackAudio.addEventListener('ended', () => {
+        if (browserFallbackIdx + 1 < browserFallbackQueue.length) {
+          playBrowserQueueTrack(browserFallbackIdx + 1);
+        }
+      });
+    }
+    if (btRoutingActive && btSinkId && typeof browserFallbackAudio.setSinkId === 'function') {
+      browserFallbackAudio.setSinkId(btSinkId).catch(() => {});
+    }
+    return browserFallbackAudio;
+  }
+
+  function playBrowserQueueTrack(idx) {
+    if (!Array.isArray(browserFallbackQueue) || !browserFallbackQueue[idx]) return;
+    browserFallbackIdx = idx;
+    const t = browserFallbackQueue[idx];
+    const audio = ensureBrowserFallbackAudio();
+    audio.src = t.url;
+    audio.play().catch(() => {});
+  }
+
+  function startBrowserFallbackQueue(act) {
+    const tracks = Array.isArray(act.audioTracks) && act.audioTracks.length > 0
+      ? act.audioTracks.filter((t) => t && t.url)
+      : (act.url ? [{ url: act.url, title: act.title || 'Media', artist: act.subtitle || '' }] : []);
+    if (tracks.length === 0) return false;
+    browserFallbackQueue = tracks;
+    playBrowserQueueTrack(0);
+    return true;
+  }
+
+  let activeMdxRawSession = null;
+  let activeMdxSessionAppId = '';
+  let activeMdxDeviceId = '';
+
+  function isRawCastSessionConnected(sess) {
+    return Boolean(sess && window.chrome && chrome.cast && chrome.cast.SessionStatus && sess.status === chrome.cast.SessionStatus.CONNECTED);
+  }
+
+  function stopRawMdxSession() {
+    if (activeMdxRawSession) {
+      try {
+        activeMdxRawSession.stop(() => {}, () => {});
+      } catch (_) {}
+    }
+    activeMdxRawSession = null;
+    activeMdxSessionAppId = '';
+    activeMdxDeviceId = '';
+  }
+
+  async function fetchMdxScreenIdFromRawSession(rawSess, timeoutMs = 4200) {
+    if (!rawSess || typeof rawSess.addMessageListener !== 'function' || typeof rawSess.sendMessage !== 'function') {
+      return '';
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const timers = [];
+      const cleanup = () => {
+        timers.forEach((t) => clearTimeout(t));
+        try {
+          if (typeof rawSess.removeMessageListener === 'function') {
+            rawSess.removeMessageListener('urn:x-cast:com.google.youtube.mdx', onMsg);
+          }
+        } catch (_) {}
+      };
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(val ? String(val) : '');
+      };
+      const onMsg = (_ns, msgStr) => {
+        try {
+          const parsed = typeof msgStr === 'string' ? JSON.parse(msgStr) : msgStr;
+          if (parsed && parsed.data && parsed.data.screenId) {
+            finish(parsed.data.screenId);
+          }
+        } catch (_) {}
+      };
+      const pingMdx = () => {
+        if (settled) return;
+        try {
+          rawSess.sendMessage(
+            'urn:x-cast:com.google.youtube.mdx',
+            { type: 'getMdxSessionStatus' },
+            () => {},
+            () => {}
+          );
+        } catch (_) {}
+      };
+      try {
+        rawSess.addMessageListener('urn:x-cast:com.google.youtube.mdx', onMsg);
+        pingMdx();
+        timers.push(setTimeout(pingMdx, 700));
+        timers.push(setTimeout(pingMdx, 1700));
+        timers.push(setTimeout(() => finish(''), timeoutMs));
+      } catch (_) {
+        finish('');
+      }
+    });
+  }
+
+  async function launchYouTubeMdxViaChromeSdk(act, fromUserClick = false) {
+    if (!castFrameworkReady && window.cast && window.cast.framework) {
+      initCastFramework(true);
+    }
+    if (!window.chrome || !chrome.cast || typeof chrome.cast.SessionRequest !== 'function' || typeof chrome.cast.requestSession !== 'function') {
+      return 'fallback';
+    }
+
+    const devHint = String(act.target || '').toLowerCase();
+    const defaultMdxApp = act.mdxAppId || (devHint.includes('alice') ? '233637DE' : '2DB7CC49');
+    let targetAppId = act.launchAppId || defaultMdxApp;
+    if (targetAppId === '233637DE' && devHint.includes('knowhere')) {
+      targetAppId = '2DB7CC49';
+    }
+    const mdxTheme = act.mdxTheme || (targetAppId === '233637DE' ? 'cl' : 'm');
+    const videoIds = Array.isArray(act.youtubeVideoIds) ? act.youtubeVideoIds.filter(Boolean) : [];
+
+    let rawSess = null;
+    if (
+      isRawCastSessionConnected(activeMdxRawSession) &&
+      activeMdxSessionAppId === targetAppId &&
+      (!act.deviceId || !activeMdxDeviceId || activeMdxDeviceId === act.deviceId)
+    ) {
+      rawSess = activeMdxRawSession;
+    } else {
+      try {
+        const sReq = new chrome.cast.SessionRequest(targetAppId);
+        rawSess = await new Promise((resolve, reject) => {
+          try {
+            chrome.cast.requestSession(resolve, reject, sReq);
+          } catch (err) {
+            reject(err);
+          }
+        });
+        activeMdxRawSession = rawSess;
+        activeMdxSessionAppId = targetAppId;
+        activeMdxDeviceId = act.deviceId || '';
+        if (rawSess && typeof rawSess.addUpdateListener === 'function') {
+          rawSess.addUpdateListener((isAlive) => {
+            if (!isAlive && activeMdxRawSession === rawSess) {
+              activeMdxRawSession = null;
+              activeMdxSessionAppId = '';
+              activeMdxDeviceId = '';
+            }
+          });
+        }
+      } catch (err) {
+        if (err && (err.code === 'cancel' || err === 'cancel')) {
+          return 'cancelled';
+        }
+        return fromUserClick ? 'fallback' : 'needs_gesture';
+      }
+    }
+
+    const rcv = rawSess && rawSess.receiver ? rawSess.receiver : null;
+    const rcvName = (rcv && rcv.friendlyName) ? String(rcv.friendlyName).trim() : String(act.target || '').trim();
+    const rcvHasVideo = rcv && Array.isArray(rcv.capabilities)
+      ? (rcv.capabilities.includes('video_out') || (window.chrome && chrome.cast && chrome.cast.Capability && rcv.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)))
+      : (targetAppId === '233637DE');
+
+    if (act.action === 'launch_app' && videoIds.length === 0) {
+      if (rcvName) {
+        const reg = await registerCastSdkDeviceToStore({
+          deviceId: (rcv && rcv.label) || '',
+          name: rcvName,
+          kind: rcvHasVideo ? 'display' : 'speaker',
+          status: 'ACTIVE',
+          mdxTheme,
+          mdxAppId: targetAppId
+        });
+        if (reg && reg.id) activeMdxDeviceId = reg.id;
+      }
+      showToast(`Launched ${act.app || targetAppId} on ${rcvName || 'Google Cast'}!`, 'success');
+      return 'ok';
+    }
+
+    if (videoIds.length > 0 && (targetAppId === '233637DE' || targetAppId === '2DB7CC49')) {
+      const screenId = (await fetchMdxScreenIdFromRawSession(rawSess, 4200)) || (act.mdxScreenId || '');
+      let targetDeviceId = act.deviceId || '';
+      if (rcvName) {
+        const reg = await registerCastSdkDeviceToStore({
+          deviceId: (rcv && rcv.label) || '',
+          name: rcvName,
+          kind: rcvHasVideo ? 'display' : 'speaker',
+          status: 'ACTIVE',
+          mdxScreenId: screenId || '',
+          mdxTheme,
+          mdxAppId: targetAppId
+        });
+        if (reg && reg.id) {
+          targetDeviceId = reg.id;
+          activeMdxDeviceId = reg.id;
+        }
+      }
+      if (screenId) {
+        try {
+          const lRes = await fetch(apiUrl('cast_lounge_play'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              deviceId: targetDeviceId,
+              screenId,
+              theme: mdxTheme,
+              videoIds,
+              listId: act.youtubeListId || ''
+            })
+          });
+          const lData = await lRes.json();
+          if (lRes.ok && lData && lData.ok) {
+            if (browserFallbackAudio) {
+              try { browserFallbackAudio.pause(); } catch (_) {}
+            }
+            if (Array.isArray(lData.devices)) {
+              devices = lData.devices;
+              renderDevices(true);
+            } else if (lData.device) {
+              const idx = devices.findIndex((d) => d.id === lData.device.id);
+              if (idx !== -1) devices[idx] = lData.device;
+              renderDevices(true);
+            }
+            persistSessionVaultFromResponse(lData);
+            showToast(`Casting full YouTube${mdxTheme === 'm' ? ' Music' : ''} to ${rcvName || act.target || 'Google Cast'}!`, 'success');
+            return 'ok';
+          }
+        } catch (_) {}
+      }
+    }
+
+    return 'fallback';
+  }
+
+  function showCastBridgePromptBanner(act) {
+    pendingCastBridgeAction = act;
+    let banner = document.getElementById('trevaCastBridgeBanner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'trevaCastBridgeBanner';
+      banner.style.cssText = 'position:fixed;bottom:22px;right:22px;z-index:9999;background:rgba(15,23,42,0.96);border:1px solid rgba(99,102,241,0.65);border-radius:14px;padding:12px 16px;box-shadow:0 12px 32px rgba(0,0,0,0.55);display:flex;align-items:center;gap:10px;color:#f8fafc;max-width:480px;backdrop-filter:blur(12px);';
+      document.body.appendChild(banner);
+    }
+    const targetName = escapeHtml(act.target || 'Google Cast');
+    const isYtm = Array.isArray(act.youtubeVideoIds) && act.youtubeVideoIds.length > 0;
+    const isLaunch = act.action === 'launch_app';
+    const titleName = escapeHtml(
+      isLaunch
+        ? `Launch ${act.app || 'App'}`
+        : ((act.resolved && (act.resolved.title || act.resolved.album)) || act.title || act.query || 'Media')
+    );
+    const hasLocalAudio = Boolean((Array.isArray(act.audioTracks) && act.audioTracks.length > 0) || act.url);
+    const subLabel = isYtm || isLaunch ? 'Direct Wi-Fi YouTube MDX / Cast Bridge' : 'Direct Wi-Fi Cast SDK Bridge';
+    banner.innerHTML = `
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:11px;color:#818cf8;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">${subLabel}</div>
+        <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Cast "${titleName}" to ${targetName}</div>
+      </div>
+      <button type="button" class="btn btn-primary btn-xs" id="trevaCastBridgeGoBtn">Cast to ${targetName}</button>
+      ${hasLocalAudio ? '<button type="button" class="btn btn-secondary btn-xs" id="trevaCastBridgeLocalBtn">Play Here</button>' : ''}
+      <button type="button" class="icon-close-btn" id="trevaCastBridgeCloseBtn" style="font-size:18px;line-height:1;">&times;</button>
+    `;
+    const goBtn = banner.querySelector('#trevaCastBridgeGoBtn');
+    const localBtn = banner.querySelector('#trevaCastBridgeLocalBtn');
+    const closeBtn = banner.querySelector('#trevaCastBridgeCloseBtn');
+    if (goBtn) {
+      goBtn.addEventListener('click', async () => {
+        banner.remove();
+        if (pendingCastBridgeAction) {
+          await loadMediaTracksOnCastSdk(pendingCastBridgeAction, true);
+        }
+      });
+    }
+    if (localBtn) {
+      localBtn.addEventListener('click', () => {
+        banner.remove();
+        if (pendingCastBridgeAction) {
+          startBrowserFallbackQueue(pendingCastBridgeAction);
+        }
+      });
+    }
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => banner.remove());
+    }
+  }
+
+  async function loadMediaTracksOnCastSdk(act, fromUserClick = false) {
+    if (!castFrameworkReady && window.cast && window.cast.framework) {
+      initCastFramework(true);
+    }
+
+    const wantsMdx = act.action === 'launch_app' || (Array.isArray(act.youtubeVideoIds) && act.youtubeVideoIds.length > 0);
+    if (wantsMdx) {
+      const mdxOutcome = await launchYouTubeMdxViaChromeSdk(act, fromUserClick);
+      if (mdxOutcome === 'ok' || mdxOutcome === 'cancelled') {
+        return;
+      }
+      if (mdxOutcome === 'needs_gesture' && !fromUserClick) {
+        showCastBridgePromptBanner(act);
+        if (btRoutingActive) startBrowserFallbackQueue(act);
+        return;
+      }
+      if (act.action === 'launch_app') {
+        showToast(`Select "${act.target || 'Google Cast'}" in Chrome's Cast chooser to launch ${act.app || 'app'}.`, 'info');
+        if (!fromUserClick) showCastBridgePromptBanner(act);
+        return;
+      }
+    }
+
+    const tracks = Array.isArray(act.audioTracks) && act.audioTracks.length > 0
+      ? act.audioTracks.filter((t) => t && t.url)
+      : (act.url ? [{
+          url: act.url,
+          contentType: act.contentType || 'audio/mpeg',
+          title: act.title || 'Treva Stream',
+          artist: act.subtitle || '',
+          album: '',
+          imageUrl: act.imageUrl || ''
+        }] : []);
+
+    if (tracks.length > 0 && castFrameworkReady && window.cast && window.cast.framework) {
+      const context = cast.framework.CastContext.getInstance();
+      let session = context.getCurrentSession();
+      if (!session) {
+        try {
+          await context.requestSession();
+          session = context.getCurrentSession();
+        } catch (err) {
+          if (err && (err.code === 'cancel' || err === 'cancel')) {
+            return;
+          }
+          if (!fromUserClick) {
+            showCastBridgePromptBanner(act);
+            if (btRoutingActive) startBrowserFallbackQueue(act);
+            return;
+          }
+        }
+      }
+
+      if (session) {
+        updateSdkUi(session);
+        if (browserFallbackAudio) {
+          try { browserFallbackAudio.pause(); } catch (_) {}
+        }
+        if (tracks.length > 1) {
+          try {
+            const rawSession = session.getSessionObj ? session.getSessionObj() : null;
+            if (rawSession && typeof rawSession.queueLoad === 'function') {
+              const qItems = tracks.map((t) => {
+                const mInfo = new chrome.cast.media.MediaInfo(t.url, t.contentType || 'audio/mpeg');
+                mInfo.streamType = chrome.cast.media.StreamType.BUFFERED;
+                const meta = new chrome.cast.media.MusicTrackMediaMetadata();
+                meta.title = t.title || 'Track';
+                meta.artist = t.artist || '';
+                meta.subtitle = t.artist || '';
+                if (t.album) meta.albumName = t.album;
+                if (t.imageUrl) meta.images = [new chrome.cast.Image(t.imageUrl)];
+                mInfo.metadata = meta;
+                const item = new chrome.cast.media.QueueItem(mInfo);
+                item.autoplay = true;
+                item.preloadTime = 4;
+                return item;
+              });
+              const qReq = new chrome.cast.media.QueueLoadRequest(qItems);
+              qReq.startIndex = 0;
+              await new Promise((resolve, reject) => {
+                rawSession.queueLoad(qReq, resolve, reject);
+              });
+              showToast(`Casting ${tracks.length}-track queue to ${act.target || 'Google Cast'}!`, 'success');
+              return;
+            }
+          } catch (_) {
+            // Fall through to single LoadRequest on first track
+          }
+        }
+
+        const t0 = tracks[0];
+        const mInfo = new chrome.cast.media.MediaInfo(t0.url, t0.contentType || 'audio/mpeg');
+        mInfo.streamType = chrome.cast.media.StreamType.BUFFERED;
+        const meta = new chrome.cast.media.MusicTrackMediaMetadata();
+        meta.title = t0.title || 'Treva Media';
+        meta.artist = t0.artist || '';
+        meta.subtitle = t0.artist || '';
+        if (t0.album) meta.albumName = t0.album;
+        if (t0.imageUrl) meta.images = [new chrome.cast.Image(t0.imageUrl)];
+        mInfo.metadata = meta;
+        const req = new chrome.cast.media.LoadRequest(mInfo);
+        req.autoplay = true;
+        await session.loadMedia(req);
+        showToast(`Casting "${t0.title || 'Media'}" to ${act.target || 'Google Cast'}!`, 'success');
+        return;
+      }
+    }
+
+    if (btRoutingActive) {
+      startBrowserFallbackQueue(act);
+    }
+    showCastBridgePromptBanner(act);
   }
 
   async function executeClientActions(actions) {
@@ -4163,38 +5255,89 @@
         for (const b of targets) {
           await controlBleDevice(b.id, payload).catch(() => {});
         }
-      } else if (act.type === 'cast_sdk' && activeCastSession) {
+      } else if (act.type === 'cast_sdk') {
+        if (['play_web_media', 'launch_app', 'play_preset', 'play_url', 'announce'].includes(act.action)) {
+          await loadMediaTracksOnCastSdk(act, false);
+          continue;
+        }
         if (act.action === 'stop') {
-          userStoppedSdkCast = true;
-          activeCastSession.endSession(true);
-          updateSdkUi(null);
-        } else if (act.action === 'set_volume' && remotePlayer && remotePlayerController && act.volume !== null) {
-          const v = Number(act.volume) > 1 ? Number(act.volume) / 100 : Number(act.volume);
-          remotePlayer.volumeLevel = Math.max(0, Math.min(1, v));
-          remotePlayerController.setVolumeLevel();
-        } else if ((act.action === 'mute' || act.action === 'unmute') && remotePlayerController && remotePlayer) {
-          const wantMute = act.action === 'mute';
-          if (Boolean(remotePlayer.isMuted) !== wantMute) {
-            remotePlayerController.muteOrUnmute();
+          if (browserFallbackAudio) {
+            try { browserFallbackAudio.pause(); browserFallbackAudio.src = ''; } catch (_) {}
           }
-        } else if (remotePlayer && remotePlayerController && remotePlayer.isMediaLoaded) {
-          const paused = Boolean(remotePlayer.isPaused);
-          if ((act.action === 'pause' && !paused) || (act.action === 'play' && paused) || act.action === 'toggle_play_pause') {
-            remotePlayerController.playOrPause();
-          } else if (['rewind', 'fast_forward', 'seek', 'restart'].includes(act.action) && remotePlayer.canSeek) {
-            const step = Number(act.seconds) > 0 ? Number(act.seconds) : 15;
-            const cur = Number(remotePlayer.currentTime) || 0;
-            const dur = Number(remotePlayer.duration) || 0;
-            let target = cur;
-            if (act.action === 'rewind') target = cur - step;
-            else if (act.action === 'fast_forward') target = cur + step;
-            else if (act.action === 'seek') target = Number(act.positionSeconds) || 0;
-            else target = 0;
-            if (dur > 0) target = Math.min(dur, target);
-            remotePlayer.currentTime = Math.max(0, target);
-            remotePlayerController.seek();
-          } else if (act.action === 'stop_media') {
-            remotePlayerController.stop();
+          stopRawMdxSession();
+          if (activeCastSession) {
+            userStoppedSdkCast = true;
+            activeCastSession.endSession(true);
+            updateSdkUi(null);
+          }
+        } else if (act.action === 'set_volume' && act.volume !== null && act.volume !== undefined) {
+          const v = Math.max(0, Math.min(1, Number(act.volume) > 1 ? Number(act.volume) / 100 : Number(act.volume)));
+          if (browserFallbackAudio) {
+            browserFallbackAudio.volume = v;
+          }
+          if (isRawCastSessionConnected(activeMdxRawSession) && typeof activeMdxRawSession.setReceiverVolumeLevel === 'function') {
+            try { activeMdxRawSession.setReceiverVolumeLevel(v, () => {}, () => {}); } catch (_) {}
+          }
+          if (activeCastSession && remotePlayer && remotePlayerController) {
+            remotePlayer.volumeLevel = v;
+            remotePlayerController.setVolumeLevel();
+          }
+        } else if (act.action === 'mute' || act.action === 'unmute') {
+          const wantMute = act.action === 'mute';
+          if (browserFallbackAudio) {
+            browserFallbackAudio.muted = wantMute;
+          }
+          if (isRawCastSessionConnected(activeMdxRawSession) && typeof activeMdxRawSession.setReceiverMuted === 'function') {
+            try { activeMdxRawSession.setReceiverMuted(wantMute, () => {}, () => {}); } catch (_) {}
+          }
+          if (activeCastSession && remotePlayerController && remotePlayer) {
+            if (Boolean(remotePlayer.isMuted) !== wantMute) {
+              remotePlayerController.muteOrUnmute();
+            }
+          }
+        } else {
+          // Transport controls on activeCastSession or browserFallbackAudio
+          if (activeCastSession && remotePlayer && remotePlayerController && remotePlayer.isMediaLoaded) {
+            const paused = Boolean(remotePlayer.isPaused);
+            if ((act.action === 'pause' && !paused) || (act.action === 'play' && paused) || act.action === 'toggle_play_pause') {
+              remotePlayerController.playOrPause();
+            } else if (act.action === 'next' || act.action === 'previous') {
+              try {
+                const rawSess = activeCastSession.getSessionObj ? activeCastSession.getSessionObj() : null;
+                const mediaObj = rawSess && Array.isArray(rawSess.media) ? rawSess.media[0] : null;
+                if (mediaObj) {
+                  if (act.action === 'next' && typeof mediaObj.queueNext === 'function') mediaObj.queueNext(null, () => {}, () => {});
+                  if (act.action === 'previous' && typeof mediaObj.queuePrev === 'function') mediaObj.queuePrev(null, () => {}, () => {});
+                }
+              } catch (_) {}
+            } else if (['rewind', 'fast_forward', 'seek', 'restart'].includes(act.action) && remotePlayer.canSeek) {
+              const step = Number(act.seconds) > 0 ? Number(act.seconds) : 15;
+              const cur = Number(remotePlayer.currentTime) || 0;
+              const dur = Number(remotePlayer.duration) || 0;
+              let target = cur;
+              if (act.action === 'rewind') target = cur - step;
+              else if (act.action === 'fast_forward') target = cur + step;
+              else if (act.action === 'seek') target = Number(act.positionSeconds) || 0;
+              else target = 0;
+              if (dur > 0) target = Math.min(dur, target);
+              remotePlayer.currentTime = Math.max(0, target);
+              remotePlayerController.seek();
+            } else if (act.action === 'stop_media') {
+              remotePlayerController.stop();
+            }
+          } else if (browserFallbackAudio && browserFallbackAudio.src) {
+            if (act.action === 'pause') browserFallbackAudio.pause();
+            else if (act.action === 'play') browserFallbackAudio.play().catch(() => {});
+            else if (act.action === 'toggle_play_pause') {
+              if (browserFallbackAudio.paused) browserFallbackAudio.play().catch(() => {});
+              else browserFallbackAudio.pause();
+            } else if (act.action === 'next' && browserFallbackIdx + 1 < browserFallbackQueue.length) {
+              playBrowserQueueTrack(browserFallbackIdx + 1);
+            } else if (act.action === 'previous' && browserFallbackIdx > 0) {
+              playBrowserQueueTrack(browserFallbackIdx - 1);
+            } else if (act.action === 'stop_media') {
+              browserFallbackAudio.pause();
+            }
           }
         }
       }
@@ -4406,7 +5549,7 @@
         smartDevices = data.smartDevices;
         renderSmartDevices(true);
       }
-      if (Array.isArray(data.devices) && serverInfo && serverInfo.isLocalEnvironment) {
+      if (Array.isArray(data.devices)) {
         devices = data.devices;
         renderDevices(true);
       }
@@ -4581,6 +5724,7 @@
           setAiUiState('listening');
         } else if (msg.type === 'conversation.item.input_audio_transcription.completed' && msg.transcript) {
           const userTxt = msg.transcript.trim();
+          lastRealtimeUserTranscript = userTxt;
           appendAiLog('user', userTxt);
           if (window.TrevaVos) {
             if (typeof window.TrevaVos.recordSystemUsage === 'function') {
@@ -4744,7 +5888,7 @@
         smartDevices = data.smartDevices;
         renderSmartDevices(true);
       }
-      if (Array.isArray(data.devices) && serverInfo && serverInfo.isLocalEnvironment) {
+      if (Array.isArray(data.devices)) {
         devices = data.devices;
         renderDevices(true);
       }

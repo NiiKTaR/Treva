@@ -24,7 +24,7 @@
   <link rel="icon" type="image/png" sizes="512x512" href="assets/icons/icon-512.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="assets/icons/apple-touch-icon.png" />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(30 12 12)'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(-30 12 12)'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="assets/css/styles.css?v=6.8" />
+  <link rel="stylesheet" href="assets/css/styles.css?v=6.10" />
   <script type="importmap">
     {
       "imports": {
@@ -298,13 +298,13 @@
           </form>
 
           <div class="ai-quick-chips" id="aiQuickChips">
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Play latest Wiz Khalifa album">Play Latest Wiz Khalifa Album</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Play lo-fi chill beats playlist on my active speaker">Play Music</button>
             <button type="button" class="chip-btn ai-chip-btn" data-prompt="What is currently playing on my Google Nest or Chromecast?">What&apos;s Playing?</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Pause or resume playback on Rabbit (Google Nest Mini)">Play / Pause Nest</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Play country night relaxation sounds on Rabbit">Country Night on Nest</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off Aire (air conditioner)">Turn off Aire</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Set Aire AC to 22 degrees Cool mode">Aire 22&deg;C Cool</button>
-            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Send Sh7p robot vacuum back to dock">Dock Sh7p</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Pause or resume playback on my active Nest speaker">Play / Pause Nest</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Play country night relaxation sounds on speaker">Country Night on Nest</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off air conditioner">Turn off AC</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Set air conditioner to 22 degrees Cool mode">AC 22&deg;C Cool</button>
+            <button type="button" class="chip-btn ai-chip-btn" data-prompt="Send robot vacuum back to dock">Dock Vacuum</button>
             <button type="button" class="chip-btn ai-chip-btn" data-prompt="Movie mode: warm dim all lights to 25% brightness">Movie Lights</button>
             <button type="button" class="chip-btn ai-chip-btn" data-prompt="Turn off all lights in the house">All Lights Off</button>
           </div>
@@ -400,7 +400,7 @@
                     <option value="magichome">Magic Home Wi-Fi (TCP 5577)</option>
                   </select>
                   <input type="text" id="smartManualName" placeholder="Friendly Name (e.g. Desk LED Strip)" class="text-input" />
-                  <input type="text" id="smartManualIp" placeholder="Wi-Fi IP (e.g. 192.168.100.9)" class="text-input" />
+                  <input type="text" id="smartManualIp" placeholder="Wi-Fi IP (e.g. 192.168.1.50)" class="text-input" />
                 </div>
                 <div class="form-row" id="smartTuyaExtraRow">
                   <input type="text" id="smartManualDevId" placeholder="Tuya Device ID (optional if IP)" class="text-input" />
@@ -428,9 +428,11 @@
                     <span class="empty-sub" id="smartCastHubMeta">Live Now Playing, Play/Pause, Voice Broadcast &amp; App Control</span>
                   </div>
                   <div class="smart-scenes-controls">
+                    <button type="button" class="btn btn-secondary btn-xs" id="smartTabDiagBtn" title="Run Local Network Diagnostic for Cast &amp; Smart Home devices">Net Diag</button>
                     <button type="button" class="btn btn-secondary btn-xs" id="smartTabScanCastBtn" title="Scan Wi-Fi for Google Nest, Chromecast &amp; Google TV">&#8635; Scan Cast</button>
                   </div>
                 </div>
+                <div class="lan-diag-box hidden" id="smartTabDiagBox"></div>
                 <div class="devices-list" id="smartCastHubList"></div>
               </div>
 
@@ -591,7 +593,8 @@
                     <p class="card-desc">Browser Wi-Fi SDK or local LAN discovery</p>
                   </div>
                   <div class="header-btns" id="localScanControls">
-                    <button type="button" class="btn btn-secondary btn-sm" id="refreshDevicesBtn" title="Scan local Wi-Fi via PHP mDNS">Scan</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="runNetDiagBtn" title="Run Local Network Diagnostic (Browser Subnet + Cast SDK + Local Bridge)">Net Diag</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="refreshDevicesBtn" title="Scan local Wi-Fi via PHP mDNS &amp; Browser Diagnostics">Scan</button>
                     <button type="button" class="btn btn-secondary btn-sm" id="addManualDeviceBtn">+ IP</button>
                   </div>
                 </div>
@@ -635,7 +638,7 @@
                 <form class="manual-device-form hidden" id="manualDeviceForm">
                   <div class="form-row">
                     <input type="text" id="manualNameInput" placeholder="Device Name (e.g. Nest Mini)" class="text-input" />
-                    <input type="text" id="manualHostInput" placeholder="IP (e.g. 192.168.100.7)" class="text-input" required />
+                    <input type="text" id="manualHostInput" placeholder="IP (e.g. 192.168.1.40)" class="text-input" required />
                   </div>
                   <div class="form-row">
                     <select id="manualKindSelect" class="select-input">
@@ -646,6 +649,8 @@
                     <button type="submit" class="btn btn-primary btn-sm">Save</button>
                   </div>
                 </form>
+
+                <div class="lan-diag-box hidden" id="castTabDiagBox"></div>
 
                 <div class="devices-list" id="devicesList">
                   <div class="empty-devices">
@@ -863,8 +868,8 @@
   <div class="toast-container" id="toastContainer"></div>
 
   <script src="assets/js/qrcode.js"></script>
-  <script type="module" src="assets/js/vos-3d.js?v=6.8"></script>
-  <script defer src="assets/js/app.js?v=6.8"></script>
-  <script defer src="assets/js/pwa.js?v=6.8"></script>
+  <script type="module" src="assets/js/vos-3d.js?v=6.10"></script>
+  <script defer src="assets/js/app.js?v=6.10"></script>
+  <script defer src="assets/js/pwa.js?v=6.10"></script>
 </body>
 </html>

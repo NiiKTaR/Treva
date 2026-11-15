@@ -613,7 +613,23 @@ class CastV2
             'requestId' => $launchRid
         ]);
 
-        $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 8.0);
+        try {
+            $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 8.0);
+        } catch (Throwable $ex) {
+            // Chromecast video receivers reject standalone YouTube Music audio appId (2DB7CC49)
+            // and use the main YouTube receiver (233637DE) for YouTube & YouTube Music sessions.
+            if ($appId === '2DB7CC49') {
+                $retryRid = $this->nextReqId();
+                $this->send($this->senderId, 'receiver-0', self::NS_RECEIVER, [
+                    'type' => 'LAUNCH',
+                    'appId' => '233637DE',
+                    'requestId' => $retryRid
+                ]);
+                $launchReply = $this->waitForReply($retryRid, 'RECEIVER_STATUS', 8.0);
+            } else {
+                throw $ex;
+            }
+        }
         return $this->getMediaState($launchReply['status'] ?? null, true);
     }
 
@@ -811,43 +827,266 @@ class CastV2
     }
 
     /**
-     * Launch the native YouTube Cast Receiver (233637DE), negotiate an MDX screenId over CastV2,
+     * Pure Cloud YouTube / YouTube Music Lounge session bind & command helper.
+     * Works from any remote public server (e.g. knowhereco.ar) without needing local LAN TCP port 8009.
+     */
+    private static function bindYouTubeLoungeSession(string $screenId, string $theme = 'cl'): array
+    {
+        $screenId = trim($screenId);
+        if ($screenId === '') {
+            return ['ok' => false, 'reason' => 'missing_screen_id'];
+        }
+        $loungeToken = '';
+        for ($tokTry = 0; $tokTry < 2 && $loungeToken === ''; $tokTry++) {
+            $ch = curl_init('https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch');
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => http_build_query(['screen_ids' => $screenId]),
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_TIMEOUT => 8,
+                CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+            ]);
+            $lRaw = (string)curl_exec($ch);
+            curl_close($ch);
+            $lData = json_decode($lRaw, true);
+            $loungeToken = (string)($lData['screens'][0]['loungeToken'] ?? '');
+            if ($loungeToken === '' && $tokTry === 0) {
+                usleep(250000);
+            }
+        }
+        if ($loungeToken === '') {
+            return ['ok' => false, 'reason' => 'no_lounge_token'];
+        }
+
+        $themesToTry = $theme === 'm' ? ['m', 'cl'] : ['cl', 'm'];
+        foreach ($themesToTry as $tryTheme) {
+            $bindParams = [
+                'device' => 'REMOTE_CONTROL',
+                'id' => 'treva-cast-remote',
+                'name' => 'Treva Smart Hub',
+                'mdx-version' => 3,
+                'theme' => $tryTheme,
+                'loungeIdToken' => $loungeToken,
+                'VER' => 8,
+                'v' => 2,
+                'RID' => random_int(10000, 89999),
+                'CVER' => 1,
+                'zx' => bin2hex(random_bytes(6)),
+                't' => 1
+            ];
+            $ch1 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($bindParams));
+            curl_setopt_array($ch1, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/x-www-form-urlencoded',
+                    'X-YouTube-LoungeId-Token: ' . $loungeToken
+                ],
+                CURLOPT_POSTFIELDS => http_build_query(['count' => 0]),
+                CURLOPT_TIMEOUT => 7,
+                CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+            ]);
+            $raw1 = (string)curl_exec($ch1);
+            curl_close($ch1);
+
+            if (str_contains($raw1, 'unmatchingTheme')) {
+                continue;
+            }
+            $sid = '';
+            $gsession = '';
+            if (preg_match('/\["c","([^"]+)"/', $raw1, $m1)) $sid = $m1[1];
+            if (preg_match('/\["S","([^"]+)"/', $raw1, $m2)) $gsession = $m2[1];
+            if ($sid === '' || $gsession === '') {
+                return ['ok' => false, 'reason' => 'bind_failed'];
+            }
+            $hasScreen = str_contains($raw1, 'LOUNGE_SCREEN') && !str_contains($raw1, 'loungeScreenDisconnected');
+            return [
+                'ok' => $hasScreen,
+                'hasScreen' => $hasScreen,
+                'reason' => $hasScreen ? 'connected' : 'screen_not_active',
+                'loungeToken' => $loungeToken,
+                'bindParams' => $bindParams,
+                'sid' => $sid,
+                'gsession' => $gsession,
+                'theme' => $tryTheme,
+                'raw' => $raw1
+            ];
+        }
+
+        return ['ok' => false, 'reason' => 'theme_mismatch'];
+    }
+
+    public static function playYouTubeLoungeCloud(string $screenId, string $theme, array $videoIds, string $listId = ''): array
+    {
+        $cleanIds = array_values(array_filter(array_map('trim', $videoIds), static fn($v) => preg_match('/^[a-zA-Z0-9_-]{11}$/', $v) === 1));
+        if (empty($cleanIds)) {
+            return ['ok' => false, 'reason' => 'no_video_ids'];
+        }
+        $session = self::bindYouTubeLoungeSession($screenId, $theme);
+        if (empty($session['ok'])) {
+            return $session;
+        }
+
+        $cmdParams = $session['bindParams'];
+        $cmdParams['SID'] = $session['sid'];
+        $cmdParams['gsessionid'] = $session['gsession'];
+        $cmdParams['RID'] = $session['bindParams']['RID'] + 1;
+        $cmdParams['AID'] = 1;
+
+        $postData = [
+            'count' => 1,
+            'ofs' => 0,
+            'req0__sc' => 'setPlaylist',
+            'req0_videoId' => $cleanIds[0],
+            'req0_videoIds' => implode(',', array_slice($cleanIds, 0, 25)),
+            'req0_currentTime' => 0,
+            'req0_currentIndex' => 0
+        ];
+        if ($listId !== '') {
+            $postData['req0_listId'] = $listId;
+        }
+
+        $ch2 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($cmdParams));
+        curl_setopt_array($ch2, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/x-www-form-urlencoded',
+                'X-YouTube-LoungeId-Token: ' . $session['loungeToken']
+            ],
+            CURLOPT_POSTFIELDS => http_build_query($postData),
+            CURLOPT_TIMEOUT => 7,
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+        ]);
+        $reply = (string)curl_exec($ch2);
+        curl_close($ch2);
+
+        return [
+            'ok' => true,
+            'screenId' => $screenId,
+            'theme' => $session['theme'],
+            'videoId' => $cleanIds[0],
+            'videoCount' => count($cleanIds),
+            'reply' => trim($reply)
+        ];
+    }
+
+    public static function controlYouTubeLoungeCloud(string $screenId, string $theme, string $action, array $opts = []): array
+    {
+        $session = self::bindYouTubeLoungeSession($screenId, $theme);
+        if (empty($session['ok'])) {
+            return $session;
+        }
+
+        $cmdParams = $session['bindParams'];
+        $cmdParams['SID'] = $session['sid'];
+        $cmdParams['gsessionid'] = $session['gsession'];
+        $cmdParams['RID'] = $session['bindParams']['RID'] + 1;
+        $cmdParams['AID'] = 1;
+
+        $postData = ['count' => 1, 'ofs' => 0];
+        $act = strtolower(trim($action));
+        if ($act === 'pause') {
+            $postData['req0__sc'] = 'pause';
+        } elseif ($act === 'play' || $act === 'resume' || $act === 'toggle_play_pause') {
+            $postData['req0__sc'] = 'play';
+        } elseif ($act === 'next') {
+            $postData['req0__sc'] = 'next';
+        } elseif ($act === 'previous') {
+            $postData['req0__sc'] = 'previous';
+        } elseif (in_array($act, ['stop', 'stop_media'], true)) {
+            $postData['req0__sc'] = 'stopVideo';
+        } elseif (in_array($act, ['seek', 'restart', 'rewind', 'fast_forward'], true)) {
+            $cur = isset($opts['currentTime']) ? (float)$opts['currentTime'] : 0.0;
+            $step = isset($opts['seconds']) ? (float)$opts['seconds'] : 15.0;
+            $targetSec = 0.0;
+            if ($act === 'seek') $targetSec = max(0.0, (float)($opts['position_seconds'] ?? 0.0));
+            elseif ($act === 'rewind') $targetSec = max(0.0, $cur - $step);
+            elseif ($act === 'fast_forward') $targetSec = max(0.0, $cur + $step);
+            $postData['req0__sc'] = 'seekTo';
+            $postData['req0_newTime'] = (int)round($targetSec);
+        } elseif (in_array($act, ['set_volume', 'volume_up', 'volume_down', 'mute', 'unmute', 'toggle_mute'], true)) {
+            $volPct = isset($opts['volumePct']) ? (int)round((float)$opts['volumePct']) : 50;
+            $postData['req0__sc'] = 'setVolume';
+            $postData['req0_volume'] = max(0, min(100, $volPct));
+        } else {
+            return ['ok' => false, 'reason' => 'unsupported_lounge_action'];
+        }
+
+        $ch2 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($cmdParams));
+        curl_setopt_array($ch2, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/x-www-form-urlencoded',
+                'X-YouTube-LoungeId-Token: ' . $session['loungeToken']
+            ],
+            CURLOPT_POSTFIELDS => http_build_query($postData),
+            CURLOPT_TIMEOUT => 7,
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
+        ]);
+        $reply = (string)curl_exec($ch2);
+        curl_close($ch2);
+
+        return [
+            'ok' => true,
+            'action' => $act,
+            'screenId' => $screenId,
+            'theme' => $session['theme'],
+            'reply' => trim($reply)
+        ];
+    }
+
+    /**
+     * Launch the native YouTube (233637DE) or YouTube Music (2DB7CC49) Cast Receiver, negotiate an MDX screenId over CastV2,
      * bind a YouTube Lounge session in pure PHP cURL, and start playing a video or album playlist.
      */
-    public function playYouTubeMdx(array $videoIds, string $listId = ''): array
+    public function playYouTubeMdx(array $videoIds, string $listId = '', string $preferredAppId = '233637DE'): array
     {
         $cleanIds = array_values(array_filter(array_map('trim', $videoIds), static fn($v) => preg_match('/^[a-zA-Z0-9_-]{11}$/', $v) === 1));
         if (empty($cleanIds)) {
             throw new InvalidArgumentException('At least one valid 11-character YouTube videoId is required.');
         }
 
+        $appOrder = $preferredAppId === '2DB7CC49' ? ['2DB7CC49', '233637DE'] : ['233637DE', '2DB7CC49'];
         $status = $this->getStatus();
         $transportId = '';
+        $activeAppId = '';
         foreach (($status['applications'] ?? []) as $app) {
-            if (($app['appId'] ?? '') === '233637DE' && !empty($app['transportId'])) {
+            $aid = (string)($app['appId'] ?? '');
+            if ($aid === $preferredAppId && !empty($app['transportId'])) {
                 $transportId = (string)$app['transportId'];
+                $activeAppId = $aid;
                 break;
             }
         }
 
         if ($transportId === '') {
-            $launchRid = $this->nextReqId();
-            $this->send($this->senderId, 'receiver-0', self::NS_RECEIVER, [
-                'type' => 'LAUNCH',
-                'appId' => '233637DE',
-                'requestId' => $launchRid
-            ]);
-            $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 8.0);
-            foreach (($launchReply['status']['applications'] ?? []) as $app) {
-                if (($app['appId'] ?? '') === '233637DE' && !empty($app['transportId'])) {
-                    $transportId = (string)$app['transportId'];
-                    break;
+            foreach ($appOrder as $tryAppId) {
+                try {
+                    $launchRid = $this->nextReqId();
+                    $this->send($this->senderId, 'receiver-0', self::NS_RECEIVER, [
+                        'type' => 'LAUNCH',
+                        'appId' => $tryAppId,
+                        'requestId' => $launchRid
+                    ]);
+                    $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 8.0);
+                    foreach (($launchReply['status']['applications'] ?? []) as $app) {
+                        if (($app['appId'] ?? '') === $tryAppId && !empty($app['transportId'])) {
+                            $transportId = (string)$app['transportId'];
+                            $activeAppId = $tryAppId;
+                            break 2;
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // Try next app ID in order
                 }
             }
         }
 
         if ($transportId === '') {
-            throw new RuntimeException('Could not launch YouTube receiver (233637DE) on Cast device.');
+            throw new RuntimeException('Could not launch YouTube / YouTube Music receiver on Cast device.');
         }
 
         $this->connectTransport($transportId);
@@ -875,104 +1114,33 @@ class CastV2
             throw new RuntimeException('Cast device did not provide a YouTube MDX screenId.');
         }
 
+        $theme = $activeAppId === '2DB7CC49' ? 'm' : 'cl';
+
         // Close the CastV2 socket before running external YouTube Lounge HTTP requests so the
         // Cast TLS connection never times out or drops while waiting on cURL.
         $this->close();
 
-        $ch = curl_init('https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => http_build_query(['screen_ids' => $screenId]),
-            CURLOPT_TIMEOUT => 8,
-            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
-        ]);
-        $lRaw = (string)curl_exec($ch);
-        curl_close($ch);
-        $lData = json_decode($lRaw, true);
-        $loungeToken = (string)($lData['screens'][0]['loungeToken'] ?? '');
-        if ($loungeToken === '') {
-            throw new RuntimeException('Could not obtain YouTube Lounge token for screenId.');
+        $cloudRes = self::playYouTubeLoungeCloud($screenId, $theme, $cleanIds, $listId);
+        if (empty($cloudRes['ok'])) {
+            throw new RuntimeException('Failed to bind YouTube Lounge session (' . ($cloudRes['reason'] ?? 'unknown') . ').');
         }
+        $theme = (string)($cloudRes['theme'] ?? $theme);
 
-        $bindParams = [
-            'device' => 'REMOTE_CONTROL',
-            'id' => 'treva-cast-remote',
-            'name' => 'Treva Smart Hub',
-            'mdx-version' => 3,
-            'loungeIdToken' => $loungeToken,
-            'VER' => 8,
-            'v' => 2,
-            'RID' => random_int(10000, 89999),
-            'CVER' => 1,
-            'zx' => bin2hex(random_bytes(6)),
-            't' => 1
+        $state = [
+            'app' => null,
+            'mediaSession' => null,
+            'mdxScreenId' => $screenId,
+            'mdxTheme' => $theme,
+            'mdxAppId' => $activeAppId
         ];
-        $ch1 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($bindParams));
-        curl_setopt_array($ch1, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/x-www-form-urlencoded',
-                'X-YouTube-LoungeId-Token: ' . $loungeToken
-            ],
-            CURLOPT_POSTFIELDS => http_build_query(['count' => 0]),
-            CURLOPT_TIMEOUT => 8,
-            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
-        ]);
-        $raw1 = (string)curl_exec($ch1);
-        curl_close($ch1);
-
-        $sid = '';
-        $gsession = '';
-        if (preg_match('/\["c","([^"]+)"/', $raw1, $m1)) $sid = $m1[1];
-        if (preg_match('/\["S","([^"]+)"/', $raw1, $m2)) $gsession = $m2[1];
-        if ($sid === '' || $gsession === '') {
-            throw new RuntimeException('Failed to bind YouTube Lounge session.');
-        }
-
-        $cmdParams = $bindParams;
-        $cmdParams['SID'] = $sid;
-        $cmdParams['gsessionid'] = $gsession;
-        $cmdParams['RID'] = $bindParams['RID'] + 1;
-        $cmdParams['AID'] = 1;
-
-        $postData = [
-            'count' => 1,
-            'ofs' => 0,
-            'req0__sc' => 'setPlaylist',
-            'req0_videoId' => $cleanIds[0],
-            'req0_videoIds' => implode(',', array_slice($cleanIds, 0, 25)),
-            'req0_currentTime' => 0,
-            'req0_currentIndex' => 0
-        ];
-        if ($listId !== '') {
-            $postData['req0_listId'] = $listId;
-        }
-
-        $ch2 = curl_init('https://www.youtube.com/api/lounge/bc/bind?' . http_build_query($cmdParams));
-        curl_setopt_array($ch2, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/x-www-form-urlencoded',
-                'X-YouTube-LoungeId-Token: ' . $loungeToken
-            ],
-            CURLOPT_POSTFIELDS => http_build_query($postData),
-            CURLOPT_TIMEOUT => 8,
-            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4
-        ]);
-        curl_exec($ch2);
-        curl_close($ch2);
-
-        $state = ['app' => null, 'mediaSession' => null];
         for ($attempt = 0; $attempt < 3; $attempt++) {
             usleep($attempt === 0 ? 1500000 : 1000000);
             try {
                 $this->close();
                 if ($this->lastHost !== '') {
                     $this->connect($this->lastHost, $this->lastPort, $this->lastTimeout);
-                    $state = $this->getMediaState(null, true);
+                    $liveState = $this->getMediaState(null, true);
+                    $state = array_merge($state, $liveState);
                     $ps = strtoupper((string)($state['mediaSession']['playerState'] ?? ''));
                     if (in_array($ps, ['PLAYING', 'BUFFERING'], true)) {
                         return $state;

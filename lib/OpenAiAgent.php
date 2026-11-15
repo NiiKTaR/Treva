@@ -388,20 +388,21 @@ class OpenAiAgent
             ],
             [
                 'name' => 'control_google_cast',
-                'description' => 'Control Google Nest speakers (any variant: Nest Mini, Nest Audio, Nest Hub, Cast Groups like Knowhere) or Chromecast / Google TV displays (like Alice) — search the internet with gpt-6-luna and play any album, song, artist, playlist, video, or radio station directly on the device (action="play_web_media" with query, e.g. "latest Wiz Khalifa album"), play/resume, pause, toggle play/pause, rewind, fast-forward, seek, next/previous track, stop playback, quit app, adjust volume (set_volume, volume_up, volume_down, mute, unmute, toggle_mute), speak/announce a voice message out loud on the speaker/TV (action="announce" with text), play ambient relaxation sounds (action="play_preset" with preset), play a direct media URL (action="play_url" with url), launch an app (action="launch_app" with app="youtube"|"youtube_music"|"spotify"|"netflix"|"relaxing_sounds"|"backdrop"), or sync live Now Playing status.',
+                'description' => 'Control Google Nest speakers (any variant: Nest Mini, Nest Audio, Nest Hub, Cast Groups like Knowhere) or Chromecast / Google TV displays (like Alice) — search the internet with gpt-6-luna and play any album, song, artist, playlist, video, or radio station directly on the device (action="play_web_media" with query, e.g. "Wiz Khalifa Cool album", "latest Wiz Khalifa album"). IMPORTANT: Even if the user says "on YouTube" or "in YouTube Music" / "en YouTube Music" while asking to play a specific artist, album, or song, ALWAYS use action="play_web_media" with query (NEVER use action="launch_app" when a song, album, or artist is requested!). Also supports play/resume, pause, toggle play/pause, rewind, fast-forward, seek, next/previous track, stop playback, quit app, adjust volume, announce TTS, play ambient sound presets, play a direct URL, launch a blank app, or sync status.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
                         'target' => ['type' => 'string', 'description' => 'Cast device name or ID (e.g. "Rabbit", "Alice", "Knowhere"), "nest" / "speaker", "chromecast" / "tv", "group" / "everywhere", or "active" to auto-target the currently playing/active device.'],
                         'action' => [
                             'type' => 'string',
+                            'description' => 'Use "play_web_media" whenever the user asks to play ANY specific album, song, artist, playlist, video, or radio station (even if they mention YouTube or YouTube Music). Only use "launch_app" when opening a blank app with NO song/album/artist requested.',
                             'enum' => [
                                 'play_web_media', 'play', 'pause', 'toggle_play_pause', 'rewind', 'fast_forward', 'seek', 'restart',
                                 'previous', 'next', 'stop_media', 'stop', 'set_volume', 'volume_up', 'volume_down',
                                 'mute', 'unmute', 'toggle_mute', 'sync_status', 'announce', 'play_preset', 'play_url', 'launch_app'
                             ]
                         ],
-                        'query' => ['type' => 'string', 'description' => 'Natural-language search query for any album, song, artist, playlist, video, or radio station on the internet when action="play_web_media" (e.g. "latest Wiz Khalifa album", "Wiz Khalifa Cool", "Daft Punk Random Access Memories", "Lo-Fi Hip Hop radio"). Resolved live via gpt-6-luna web search and played directly on the Chromecast or Google Nest device.'],
+                        'query' => ['type' => 'string', 'description' => 'Required when action="play_web_media" (or whenever a specific artist, album, song, or video is requested, even if YouTube Music or YouTube is mentioned). Natural-language search query (e.g. "Wiz Khalifa Cool album", "latest Wiz Khalifa album", "Daft Punk Random Access Memories"). Resolved live via gpt-6-luna web search and played directly on the Chromecast or Google Nest device.'],
                         'seconds' => ['type' => 'number', 'description' => 'Seconds to rewind or fast_forward (defaults to 15 seconds if omitted).'],
                         'position_seconds' => ['type' => 'number', 'description' => 'Target playback position in seconds when action is seek.'],
                         'volume_pct' => ['type' => 'integer', 'description' => 'Volume percentage 0..100 when action is set_volume.'],
@@ -415,7 +416,7 @@ class OpenAiAgent
                         'title' => ['type' => 'string', 'description' => 'Optional media title when action="play_url".'],
                         'app' => [
                             'type' => 'string',
-                            'description' => 'App to open on Chromecast / Google TV / Nest Display when action="launch_app" (e.g. "youtube", "youtube_music", "spotify", "netflix", "relaxing_sounds", "backdrop").'
+                            'description' => 'ONLY used when action="launch_app" to open a blank app screen with NO song, album, or artist requested (e.g. "youtube", "youtube_music", "spotify", "netflix", "relaxing_sounds", "backdrop"). Do NOT use launch_app if the user asked to play a song, album, or artist!'
                         ]
                     ],
                     'required' => ['action']
@@ -530,7 +531,7 @@ class OpenAiAgent
     {
         $smartPublic = $store->getSmartDevicesPublic();
         $scenesDoc = $store->getSmartScenes();
-        $castDevs = NetworkHelper::isLocalEnvironment() ? array_values($store->getDevices()) : [];
+        $castDevs = array_values($store->getDevices());
 
         $lights = [];
         $irDevices = [];
@@ -669,9 +670,9 @@ Current live home inventory and Tap-to-Run scenes:
 Smart Control Rules:
 1. Lights (`Lámpara1`, `Lámpara2`, `Lámpara3`, Magic Home `Cielo`, or `all_lights`): use `control_smart_light`. Magic Home supports power, brightness, RGB hex color, color temperature approximation, and effect presets (37=fade, 38=red pulse, 41=strobe, 56=jump). Tuya lamps also support `color_temp_pct` (0=warm, 100=cool) and `countdown_seconds`.
 2. Robot Vacuum (`Sh7p`): use `control_robot_vacuum` (`start_clean`, `pause`, `dock`, `mop`, `power_off`, `power_on`).
-3. Infrared (IR) Remotes & Symbolic Scene Links (`Aire` AC, `Edifier` speakers, `TV`, fans `SA7335` / `R-I_-2`, air purifier `R-312`): EVERY Tap-to-Run scene in `tapToRunScenes` includes its decoded `config`, target `device`, and symbolic `voiceLinks`. Whenever the user gives a voice/text command matching a symbolically linked scene — e.g. `"put the air conditioner on 18"` -> `Thunder18` (`M0_T18_S1_0`), `"put it on dry mode"` -> `Dry` (`M4_S1_0`), `"turn power mode on the air conditioner"` / `"jet mode"` / `"jetmode"` -> `"R-312":jetmode` (AC Jet / Power Mode on `Aire`, id `Ed6MOOQ1qnlQKdjj`, NOT the air purifier), `"fan mode"` -> `Ventilador`, `"heat"` -> `Incendio`, `"auto"` -> `Automatico`, `"turn off Aire"` -> `Power Off`, `"start FIKA"` -> `FIKA`, or any custom `voiceLinks` / `"Device":cmd` scene — trigger it directly via `trigger_tuya_scene` with exact `scene_id` (or `scene_name` + `device_hint`). If the requested IR command has NO matching scene (for example `24°C` / `Thunder24` if not synced yet, or fine volume/channel controls), try `control_ir_device` first; if Tuya Universal IR (`28841101`) is unsubscribed, explain honestly and offer the nearest available scenes (e.g. `Thunder22` / `Thunder26`) or ask the user to link/create the scene without silently picking the wrong temperature. Never confuse ambiguous toggles like `Switch Parlante` / `"Loudspeaker":power` with confirmed off state without mentioning it is a power toggle.
+3. Infrared (IR) Remotes & Symbolic Scene Links: EVERY Tap-to-Run scene in `tapToRunScenes` includes its decoded `config`, target `device`, and symbolic `voiceLinks`. Whenever the user gives a voice/text command matching a symbolically linked scene — e.g. `"put the air conditioner on 18"` -> `Thunder18` (`M0_T18_S1_0`), `"put it on dry mode"` -> `Dry` (`M4_S1_0`), `"turn power mode on the air conditioner"` / `"jet mode"` / `"jetmode"` -> `"R-312":jetmode` (AC Jet / Power Mode), `"fan mode"` -> `Ventilador`, `"heat"` -> `Incendio`, `"auto"` -> `Automatico`, `"turn off AC"` -> `Power Off`, or any custom `voiceLinks` / `"Device":cmd` scene — trigger it directly via `trigger_tuya_scene` with exact `scene_id` (or `scene_name` + `device_hint`). If the requested IR command has NO matching scene, try `control_ir_device` first; if Tuya Universal IR (`28841101`) is unsubscribed, explain honestly and offer the nearest available scenes or ask the user to link/create the scene without silently picking the wrong temperature. Never confuse ambiguous toggles like `Switch Parlante` / `"Loudspeaker":power` with confirmed off state without mentioning it is a power toggle.
 4. Complex multi-device scenes ("movie night", "goodnight", "turn off everything"): call `batch_smart_actions` in a single request so every device changes smoothly.
-5. Google Cast speakers/displays (`Alice` Chromecast, `Rabbit` Google Nest Mini, `Knowhere` Cast Group, or any Google Nest / Google TV variant): whenever the user asks to play any specific artist, album, song, music, video, or radio station from the internet (e.g. "Play latest Wiz Khalifa album", "Play Wiz Khalifa on Rabbit", "Play Daft Punk on Alice"), IMMEDIATELY call `control_google_cast` with `action="play_web_media"` and `query="<what the user asked to play>"` (do NOT delegate to `ask_smart_reasoner` first — `play_web_media` automatically runs `gpt-6-luna` live web search to find the URL/tracks and starts playing directly on the Chromecast or Google Nest!). Also use `control_google_cast` to `play` (resume), `pause`, `toggle_play_pause`, `rewind` (`seconds`, default 15), `fast_forward` (`seconds`), `seek` (`position_seconds`), `restart`, `previous`, `next`, `stop_media`, `stop` (exit app), `set_volume`, `volume_up`, `volume_down`, `mute`/`unmute`/`toggle_mute`, `announce` (speak a voice message `text` out loud on the speaker/TV), `play_preset` (`country_night`, `rain`, `ocean`, `thunderstorm`, `fireplace`, `forest`, `running_water`, `white_noise`), `play_url` (`url`), `launch_app` (`youtube`, `youtube_music`, `spotify`, `netflix`, `relaxing_sounds`, `backdrop`), or `sync_status` on active Cast sessions (use `target="active"` when the user doesn't specify a device name). Bluetooth BLE lights: use `control_ble_light`.{$delegationRule}
+5. Google Cast speakers/displays (`Alice` Chromecast, `Rabbit` Google Nest Mini, `Knowhere` Cast Group, or any Google Nest / Google TV variant): whenever the user asks to play any specific artist, album, song, music, video, or radio station from the internet (e.g. "Play latest Wiz Khalifa album", "Reproducir el último álbum llamado Cool de Wiz Khalifa en YouTube Music en Alice", "Play Wiz Khalifa on Rabbit"), IMMEDIATELY call `control_google_cast` with `action="play_web_media"` and `query="<artist / album / song>"` (e.g. `query="Wiz Khalifa Cool album"`). CRITICAL: Even if the user explicitly mentions "in YouTube Music" / "en YouTube Music" or "on YouTube", NEVER call `action="launch_app"` when a specific artist, album, or song is requested — ALWAYS call `action="play_web_media"` with `query`! Also do NOT delegate `play_web_media` to `ask_smart_reasoner` first — `play_web_media` automatically runs `gpt-6-luna` live web search to find the URL/tracks and starts playing directly on the Chromecast or Google Nest! Also use `control_google_cast` to `play` (resume), `pause`, `toggle_play_pause`, `rewind` (`seconds`, default 15), `fast_forward` (`seconds`), `seek` (`position_seconds`), `restart`, `previous`, `next`, `stop_media`, `stop` (exit app), `set_volume`, `volume_up`, `volume_down`, `mute`/`unmute`/`toggle_mute`, `announce` (speak a voice message `text` out loud on the speaker/TV), `play_preset` (`country_night`, `rain`, `ocean`, `thunderstorm`, `fireplace`, `forest`, `running_water`, `white_noise`), `play_url` (`url`), `launch_app` (ONLY when opening a blank app with NO song/album/artist specified), or `sync_status` on active Cast sessions (use `target="active"` when the user doesn't specify a device name). Bluetooth BLE lights: use `control_ble_light`.{$delegationRule}
 PROMPT;
     }
 
@@ -914,21 +915,28 @@ PROMPT;
                         $mediaOpts[$optKey] = trim($args[$optKey]);
                     }
                 }
-                $res = SmartController::controlCast($store, $target, $action, $vol, $muted, $mediaOpts);
-                if (!empty($res['clientSideRequired']) && empty($clientContext['castSdk'])) {
-                    return [
-                        'ok' => false,
-                        'error' => "No active media session found on Google Cast or Nest devices matching '{$target}'.",
-                        'availableCastDevices' => array_values(array_map(static fn($c) => [
-                            'name' => $c['name'] ?? '',
-                            'model' => $c['model'] ?? '',
-                            'status' => $c['status'] ?? 'IDLE',
-                            'appName' => $c['appName'] ?? null
-                        ], $store->getDevices()))
-                    ];
+                if ($action === 'launch_app' && empty($mediaOpts['query'])) {
+                    $lastTranscript = trim((string)($clientContext['lastUserTranscript'] ?? ''));
+                    if ($lastTranscript !== '') {
+                        $cleaned = preg_replace('/^[\s¿¡]*(?:podr[ií]as\s+|puedes\s+|por\s+favor\s+|please\s+|can\s+you\s+|could\s+you\s+|quiero\s+que\s+)*(?:reproducir|reproduce|reproduzcas|poner|pon|pongas|escuchar|abrir|abre|play|put\s+on|open|launch)\s+/iu', '', $lastTranscript);
+                        $cleaned = preg_replace('/(?:\s+(?:en|on|in|to|hacia)\s+(?:el\s+|la\s+|the\s+)?(?:dispositivo\s+|device\s+)?(?:chromecast|google\s*nest(?:\s*mini|\s*hub|\s*audio)?|google\s*home|google\s*tv|altavoz|speaker|tv|televisor)\s*(?:llamado|named|called)?\s*[\p{L}\p{N}_\-]+)+\s*[?.!]*$/iu', '', (string)$cleaned);
+                        if ($target !== '' && $target !== 'active') {
+                            $cleaned = preg_replace('/\s+(?:en|on|in|to)\s+(?:el\s+|la\s+|the\s+)?(?:dispositivo\s+|device\s+)?(?:llamado\s+|named\s+|called\s+)?' . preg_quote($target, '/') . '\s*[?.!]*$/iu', '', (string)$cleaned);
+                        }
+                        $cleaned = preg_replace('/\b(?:llamado|llamada|titulado|titulada|named|called|titled)\s+/iu', '', (string)$cleaned);
+                        $cleaned = trim((string)$cleaned, " \t\n\r\0\x0B?.!¿¡");
+                        $probe = preg_replace('/\b(?:en|in|on|de|from|youtube\s*music|youtube|yt\s*music|spotify|netflix|twitch|chromecast|google\s*nest|dispositivo|device|el|la|the|un|una)\b/iu', ' ', $cleaned);
+                        $probe = trim((string)preg_replace('/\s+/', ' ', (string)$probe));
+                        if (mb_strlen($probe) >= 3) {
+                            $action = 'play_web_media';
+                            $mediaOpts['query'] = $cleaned;
+                        }
+                    }
                 }
+                $res = SmartController::controlCast($store, $target, $action, $vol, $muted, $mediaOpts);
                 if (!empty($res['clientAction'])) {
                     $clientActions[] = $res['clientAction'];
+                    unset($res['clientAction']);
                 }
                 return $res;
 

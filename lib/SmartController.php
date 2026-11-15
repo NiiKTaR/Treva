@@ -624,10 +624,17 @@ class SmartController
 
     public static function syncCastDevice(StreamStore $store, array $dev, float $timeoutSec = 2.0): array
     {
+        if (!NetworkHelper::isLocalEnvironment()) {
+            return $dev;
+        }
+        $host = trim((string)($dev['host'] ?? ''));
+        if ($host === '' || !empty($dev['isSdkOnly']) || !filter_var($host, FILTER_VALIDATE_IP)) {
+            return $dev;
+        }
         $devId = (string)($dev['id'] ?? '');
         $cast = new CastV2();
         try {
-            $cast->connect((string)$dev['host'], (int)$dev['port'], $timeoutSec);
+            $cast->connect($host, (int)($dev['port'] ?? 8009), $timeoutSec);
             $mediaState = $cast->getMediaState(null, true);
             $cast->close();
             return self::applyCastMediaStateToStore($store, $devId, $dev, $mediaState);
@@ -640,36 +647,74 @@ class SmartController
     public static function ensureCastDevicesDiscovered(StreamStore $store, float $timeoutSec = 1.2): array
     {
         $devices = $store->getDevices();
-        if (!empty($devices) || !NetworkHelper::isLocalEnvironment()) {
+        if (!NetworkHelper::isLocalEnvironment()) {
+            return $devices;
+        }
+        $hasOnlineLan = false;
+        foreach ($devices as $d) {
+            if (!empty($d['host']) && empty($d['isSdkOnly']) && (!array_key_exists('online', $d) || !empty($d['online']))) {
+                $hasOnlineLan = true;
+                break;
+            }
+        }
+        if ($hasOnlineLan) {
             return $devices;
         }
         $settings = $store->getSettings();
         $bindIp = $settings['selectedLanIp'] ?? '';
         $found = CastMdns::discover($bindIp, $timeoutSec);
-        if (!empty($found)) {
-            return $store->mergeDiscoveredDevices($found);
+        if (!empty($found) || !empty($devices)) {
+            return $store->mergeDiscoveredDevices($found, true);
         }
         return $devices;
     }
 
     public static function syncAllCastDevices(StreamStore $store, float $timeoutSec = 1.4, bool $onlyIfStale = false, int $staleSec = 5): array
     {
+        if (!NetworkHelper::isLocalEnvironment()) {
+            return array_values($store->getDevices());
+        }
         self::ensureCastDevicesDiscovered($store, 1.2);
         $now = time();
+        $autoTried = 0;
+        $autoFailed = 0;
         foreach ($store->getDevices() as $id => $dev) {
+            if (empty($dev['host']) || !empty($dev['isSdkOnly'])) {
+                continue;
+            }
             if (array_key_exists('online', $dev) && !$dev['online']) {
                 continue;
             }
             if ($onlyIfStale && ($now - (int)($dev['mediaSyncAt'] ?? 0)) < $staleSec) {
                 continue;
             }
+            $isAuto = empty($dev['isManual']);
+            if ($isAuto) $autoTried++;
             try {
                 self::syncCastDevice($store, $dev, $timeoutSec);
             } catch (Throwable $ex) {
-                $store->updateDevice((string)$id, ['mediaSyncAt' => $now]);
+                if ($isAuto) {
+                    $autoFailed++;
+                    $store->updateDevice((string)$id, ['online' => false, 'mediaSyncAt' => $now]);
+                } else {
+                    $store->updateDevice((string)$id, ['mediaSyncAt' => $now]);
+                }
             }
         }
-        return array_values($store->getDevices());
+        if ($autoTried > 0 && $autoFailed === $autoTried) {
+            $settings = $store->getSettings();
+            $bindIp = $settings['selectedLanIp'] ?? '';
+            $found = CastMdns::discover($bindIp, 1.1);
+            $store->mergeDiscoveredDevices($found, true);
+        }
+        $activeList = [];
+        foreach ($store->getDevices() as $d) {
+            if (empty($d['isManual']) && empty($d['isSdkOnly']) && array_key_exists('online', $d) && !$d['online']) {
+                continue;
+            }
+            $activeList[] = $d;
+        }
+        return $activeList;
     }
 
     private static function resolveCastTarget(StreamStore $store, string $deviceIdOrName, string $actionNorm = ''): ?array
@@ -689,6 +734,22 @@ class SmartController
                     return $dev;
                 }
             }
+            // Fuzzy Levenshtein match for voice STT phonetic misspellings (e.g. "Arif" -> "Alice", "Rabit" -> "Rabbit")
+            $bestFuzzy = null;
+            $bestDist = 99;
+            foreach ($devices as $dev) {
+                $dName = strtolower(trim((string)($dev['name'] ?? '')));
+                if ($dName === '') continue;
+                $dist = levenshtein($needle, $dName);
+                $maxAllowed = ($needle[0] === $dName[0] && strlen($dName) >= 4) ? 3 : 2;
+                if ($dist <= $maxAllowed && $dist < $bestDist) {
+                    $bestDist = $dist;
+                    $bestFuzzy = $dev;
+                }
+            }
+            if ($bestFuzzy !== null) {
+                return $bestFuzzy;
+            }
         }
 
         $isAuto = ($needle === '' || in_array($needle, ['active', 'auto', 'current', 'playing', 'music', 'youtube', 'youtube music', 'media'], true));
@@ -703,7 +764,11 @@ class SmartController
         }
 
         if (!$isAuto && $catHint === '' && !$wantGroup) {
-            return null;
+            if (in_array($actionNorm, ['play_web_media', 'launch_app', 'play_preset', 'play_url', 'announce', 'say'], true)) {
+                $isAuto = true;
+            } else {
+                return null;
+            }
         }
 
         $freshDevices = self::syncAllCastDevices($store, 1.5, true, 3);
@@ -825,6 +890,11 @@ class SmartController
         }
         $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/api.php';
         $basePath = rtrim(str_replace('\\', '/', dirname($scriptName)), '/');
+        if (!NetworkHelper::isLocalEnvironment()) {
+            $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+            $scheme = $isHttps ? 'https' : 'http';
+            return "{$scheme}://{$httpHost}{$basePath}/api.php?action=cast_tts_audio&file=" . urlencode($fileName);
+        }
         return "http://{$selectedLanIp}{$portSuffix}{$basePath}/api.php?action=cast_tts_audio&file=" . urlencode($fileName);
     }
 
@@ -850,24 +920,45 @@ class SmartController
             $mediaOpts['query'] = (string)$mediaOpts['url'];
             $actionNorm = 'play_web_media';
         }
+        if ($actionNorm === 'launch_app' && (!empty($mediaOpts['query']) || !empty($mediaOpts['title']) || !empty($mediaOpts['text']))) {
+            $mediaOpts['query'] = trim((string)($mediaOpts['query'] ?? ($mediaOpts['title'] ?? $mediaOpts['text'])));
+            $actionNorm = 'play_web_media';
+        }
 
         $target = self::resolveCastTarget($store, $deviceIdOrName, $actionNorm);
 
         if (!$target) {
-            return [
-                'ok' => true,
-                'clientSideRequired' => true,
-                'clientAction' => [
-                    'type' => 'cast_sdk',
-                    'action' => $actionNorm,
-                    'volume' => $volume,
-                    'muted' => $muted,
-                    'seconds' => $mediaOpts['seconds'] ?? null,
-                    'positionSeconds' => $mediaOpts['position_seconds'] ?? null,
-                    'target' => $deviceIdOrName
-                ],
-                'note' => 'No active local LAN Cast device matched; forwarded to active Chrome Cast SDK session if connected.'
-            ];
+            $supportsSdkMediaBridge = in_array($actionNorm, [
+                'play_web_media', 'launch_app', 'play_preset', 'play_url', 'say', 'announce'
+            ], true);
+            if ($supportsSdkMediaBridge) {
+                $target = [
+                    'id' => '',
+                    'name' => trim($deviceIdOrName) !== '' ? trim($deviceIdOrName) : 'Active Cast Device',
+                    'kind' => preg_match('/\b(nest|mini|speaker|parlante|bocina|group)\b/i', $deviceIdOrName) ? 'speaker' : 'display',
+                    'host' => '',
+                    'port' => 8009,
+                    'online' => true,
+                    'isSdkOnly' => true,
+                    'volume' => 0.7,
+                    'muted' => false
+                ];
+            } else {
+                return [
+                    'ok' => true,
+                    'clientSideRequired' => true,
+                    'clientAction' => [
+                        'type' => 'cast_sdk',
+                        'action' => $actionNorm,
+                        'volume' => $volume,
+                        'muted' => $muted,
+                        'seconds' => $mediaOpts['seconds'] ?? null,
+                        'positionSeconds' => $mediaOpts['position_seconds'] ?? null,
+                        'target' => $deviceIdOrName
+                    ],
+                    'note' => 'No active local LAN Cast device matched; forwarded to active Chrome Cast SDK session if connected.'
+                ];
+            }
         }
 
         $devId = (string)$target['id'];
@@ -889,6 +980,21 @@ class SmartController
             $preTtsText = trim((string)($mediaOpts['text'] ?? ''));
             $voice = trim((string)($mediaOpts['voice'] ?? 'verse')) ?: 'verse';
             $preTtsUrl = self::generateCastTtsUrl($store, $preTtsText, $voice);
+        }
+
+        if (!NetworkHelper::isLocalEnvironment() || empty($target['host']) || !empty($target['isSdkOnly'])) {
+            return self::executeRemoteOrBrowserCastFallback(
+                $store,
+                $target,
+                $actionNorm,
+                $volume,
+                $muted,
+                $mediaOpts,
+                $preResolvedMedia,
+                $preResolvedQuery,
+                $preTtsUrl,
+                $preTtsText
+            );
         }
 
         $cast = new CastV2();
@@ -972,12 +1078,24 @@ class SmartController
                 $playbackMethod = 'cast_audio_queue';
                 $mediaState = null;
 
-                if (($isDisplay || ($resolved['intent'] ?? '') === 'video') && !empty($resolved['youtubeVideoIds'])) {
+                if (!empty($resolved['youtubeVideoIds'])) {
                     try {
-                        $ytState = $cast->playYouTubeMdx($resolved['youtubeVideoIds'], (string)($resolved['youtubeListId'] ?? ''));
+                        $preferredYtApp = $isDisplay ? '233637DE' : '2DB7CC49';
+                        $ytState = $cast->playYouTubeMdx(
+                            $resolved['youtubeVideoIds'],
+                            (string)($resolved['youtubeListId'] ?? ''),
+                            $preferredYtApp
+                        );
+                        if (!empty($ytState['mdxScreenId'])) {
+                            $store->updateDevice($devId, [
+                                'mdxScreenId' => (string)$ytState['mdxScreenId'],
+                                'mdxTheme' => (string)($ytState['mdxTheme'] ?? ($isDisplay ? 'cl' : 'm')),
+                                'mdxAppId' => (string)($ytState['mdxAppId'] ?? $preferredYtApp)
+                            ]);
+                        }
                         $ytPs = strtoupper((string)($ytState['mediaSession']['playerState'] ?? ''));
                         $ytAppId = (string)($ytState['app']['appId'] ?? '');
-                        if (in_array($ytPs, ['PLAYING', 'BUFFERING'], true) || $ytAppId === '233637DE') {
+                        if (in_array($ytPs, ['PLAYING', 'BUFFERING'], true) || in_array($ytAppId, ['233637DE', '2DB7CC49'], true)) {
                             $mediaState = $ytState;
                             $playbackMethod = 'youtube_mdx';
                         }
@@ -1099,7 +1217,358 @@ class SmartController
             ];
         } catch (Throwable $ex) {
             $cast->close();
-            throw $ex;
+            return self::executeRemoteOrBrowserCastFallback(
+                $store,
+                $target,
+                $actionNorm,
+                $volume,
+                $muted,
+                $mediaOpts,
+                $preResolvedMedia,
+                $preResolvedQuery,
+                $preTtsUrl,
+                $preTtsText
+            );
         }
+    }
+
+    /**
+     * Cloud YouTube Lounge + Browser Cast SDK / Web Audio Bridge for remote domains (e.g. knowhereco.ar)
+     * when XAMPP is turned off or when accessed from another PC without XAMPP.
+     */
+    private static function executeRemoteOrBrowserCastFallback(
+        StreamStore $store,
+        array $target,
+        string $actionNorm,
+        ?float $volume,
+        ?bool $muted,
+        array $mediaOpts,
+        ?array $preResolvedMedia,
+        string $preResolvedQuery,
+        string $preTtsUrl,
+        string $preTtsText
+    ): array {
+        $devId = (string)($target['id'] ?? '');
+        $devName = (string)($target['name'] ?? 'Google Cast');
+        $isDisplay = (($target['kind'] ?? '') === 'display')
+            || preg_match('/chromecast|tv|hub/i', (string)($target['model'] ?? ($target['variant'] ?? '')));
+
+        // Enrich with default seed MDX screenId if missing in session
+        $seed = StreamStore::defaultCastDevicesSeed();
+        if (empty($target['mdxScreenId'])) {
+            if (isset($seed[$devId])) {
+                $target = array_merge($seed[$devId], $target);
+            } else {
+                foreach ($seed as $sDev) {
+                    if (strcasecmp((string)($sDev['name'] ?? ''), $devName) === 0) {
+                        $target = array_merge($sDev, $target);
+                        break;
+                    }
+                }
+            }
+        }
+
+        $candidates = [];
+        if (!empty($target['mdxScreenId'])) {
+            $candidates[] = [
+                'screenId' => (string)$target['mdxScreenId'],
+                'theme' => (string)($target['mdxTheme'] ?? ($isDisplay ? 'cl' : 'm'))
+            ];
+        }
+        if (!empty($target['mdxAltScreenId'])) {
+            $candidates[] = [
+                'screenId' => (string)$target['mdxAltScreenId'],
+                'theme' => (string)($target['mdxAltTheme'] ?? 'cl')
+            ];
+        }
+
+        // 1. Remote Cloud YouTube / YouTube Music Lounge Playback
+        if ($actionNorm === 'play_web_media') {
+            $resolved = $preResolvedMedia ?? [];
+            $query = $preResolvedQuery;
+            $resolvedSummary = [
+                'model' => $resolved['model'] ?? 'gpt-6-luna',
+                'intent' => $resolved['intent'] ?? 'album',
+                'artist' => $resolved['artist'] ?? '',
+                'title' => $resolved['title'] ?? '',
+                'album' => $resolved['album'] ?? '',
+                'year' => $resolved['year'] ?? '',
+                'summary' => $resolved['summary'] ?? '',
+                'trackCount' => count($resolved['audioTracks'] ?? []),
+                'youtubeCount' => count($resolved['youtubeVideoIds'] ?? [])
+            ];
+
+            $firstAudio = $resolved['audioTracks'][0] ?? null;
+            $firstYtId = $resolved['youtubeVideoIds'][0] ?? '';
+            $optimisticMedia = [
+                'mediaSessionId' => 1,
+                'playerState' => 'PLAYING',
+                'title' => $firstAudio['title'] ?? ($resolved['title'] ?? $query),
+                'artist' => $firstAudio['artist'] ?? ($resolved['artist'] ?? ''),
+                'album' => $firstAudio['album'] ?? ($resolved['album'] ?? ''),
+                'imageUrl' => $firstAudio['imageUrl'] ?? '',
+                'contentId' => $firstYtId !== '' ? $firstYtId : ($firstAudio['url'] ?? ''),
+                'contentType' => $firstYtId !== '' ? 'x-youtube/video' : ($firstAudio['contentType'] ?? 'audio/mpeg'),
+                'currentTime' => 0,
+                'duration' => $firstAudio['duration'] ?? null,
+                'canPause' => true,
+                'canSeek' => true,
+                'canNext' => count($resolved['audioTracks'] ?? []) > 1 || count($resolved['youtubeVideoIds'] ?? []) > 1,
+                'canPrev' => count($resolved['audioTracks'] ?? []) > 1 || count($resolved['youtubeVideoIds'] ?? []) > 1,
+                'updatedAt' => time()
+            ];
+
+            if (!empty($resolved['youtubeVideoIds']) && !empty($candidates)) {
+                foreach ($candidates as $cand) {
+                    $cloudRes = CastV2::playYouTubeLoungeCloud(
+                        $cand['screenId'],
+                        $cand['theme'],
+                        $resolved['youtubeVideoIds'],
+                        (string)($resolved['youtubeListId'] ?? '')
+                    );
+                    if (!empty($cloudRes['ok'])) {
+                        $usedTheme = (string)($cloudRes['theme'] ?? $cand['theme']);
+                        $appId = $usedTheme === 'm' ? '2DB7CC49' : '233637DE';
+                        $appName = $usedTheme === 'm' ? 'YouTube Music' : 'YouTube';
+                        $updated = $store->updateDevice($devId, [
+                            'status' => 'PLAYING',
+                            'appId' => $appId,
+                            'appName' => $appName,
+                            'media' => $optimisticMedia,
+                            'mediaSyncAt' => time()
+                        ]);
+                        return [
+                            'ok' => true,
+                            'action' => 'play_web_media',
+                            'query' => $query,
+                            'playbackMethod' => 'youtube_lounge_cloud',
+                            'resolved' => $resolvedSummary,
+                            'device' => $updated,
+                            'app' => ['appId' => $appId, 'displayName' => $appName],
+                            'media' => $optimisticMedia
+                        ];
+                    }
+                }
+            }
+
+            // Fallback to Browser Google Cast SDK / Web Audio Queue Bridge
+            $clientAction = [
+                'type' => 'cast_sdk',
+                'action' => 'play_web_media',
+                'target' => $devName,
+                'deviceId' => $devId,
+                'mdxScreenId' => $target['mdxScreenId'] ?? '',
+                'mdxTheme' => $target['mdxTheme'] ?? ($isDisplay ? 'cl' : 'm'),
+                'mdxAppId' => $target['mdxAppId'] ?? ($isDisplay ? '233637DE' : '2DB7CC49'),
+                'query' => $query,
+                'resolved' => $resolvedSummary,
+                'audioTracks' => array_slice($resolved['audioTracks'] ?? [], 0, 20),
+                'youtubeVideoIds' => array_slice($resolved['youtubeVideoIds'] ?? [], 0, 20),
+                'youtubeListId' => (string)($resolved['youtubeListId'] ?? '')
+            ];
+
+            $updated = $store->updateDevice($devId, [
+                'status' => 'PLAYING',
+                'appId' => 'CC1AD845',
+                'appName' => 'Browser Cast Bridge',
+                'media' => $optimisticMedia,
+                'mediaSyncAt' => time()
+            ]);
+
+            return [
+                'ok' => true,
+                'action' => 'play_web_media',
+                'query' => $query,
+                'playbackMethod' => 'browser_cast_bridge',
+                'clientSideRequired' => true,
+                'clientAction' => $clientAction,
+                'resolved' => $resolvedSummary,
+                'device' => $updated,
+                'media' => $optimisticMedia
+            ];
+        }
+
+        // 2. Sound Presets, Direct URLs, and TTS Announcements via Browser Cast Bridge
+        if (in_array($actionNorm, ['play_preset', 'play_url', 'say', 'announce'], true)) {
+            $streamUrl = '';
+            $contentType = 'audio/mpeg';
+            $title = 'Treva Media';
+            $subtitle = $devName;
+            $imageUrl = '';
+
+            if ($actionNorm === 'play_preset') {
+                $presetKey = trim((string)($mediaOpts['preset'] ?? $mediaOpts['url'] ?? 'country_night'));
+                $preset = CastV2::resolveSoundPreset($presetKey) ?? CastV2::SOUND_PRESETS['country_night'];
+                $streamUrl = $preset['url'];
+                $contentType = $preset['contentType'];
+                $title = $preset['title'];
+                $subtitle = $preset['artist'];
+                $imageUrl = $preset['imageUrl'] ?? '';
+            } elseif ($actionNorm === 'play_url') {
+                $streamUrl = trim((string)($mediaOpts['url'] ?? ''));
+                $contentType = trim((string)($mediaOpts['content_type'] ?? 'audio/mpeg')) ?: 'audio/mpeg';
+                $title = trim((string)($mediaOpts['title'] ?? 'Treva Stream')) ?: 'Treva Stream';
+                $subtitle = trim((string)($mediaOpts['subtitle'] ?? $devName)) ?: $devName;
+                $imageUrl = trim((string)($mediaOpts['image_url'] ?? ''));
+            } else {
+                $streamUrl = $preTtsUrl;
+                $contentType = 'audio/mpeg';
+                $title = 'Treva Announcement';
+                $subtitle = $preTtsText;
+            }
+
+            $optimisticMedia = [
+                'mediaSessionId' => 1,
+                'playerState' => 'PLAYING',
+                'title' => $title,
+                'artist' => $subtitle,
+                'album' => '',
+                'imageUrl' => $imageUrl,
+                'contentId' => $streamUrl,
+                'contentType' => $contentType,
+                'currentTime' => 0,
+                'duration' => null,
+                'canPause' => true,
+                'canSeek' => true,
+                'canNext' => false,
+                'canPrev' => false,
+                'updatedAt' => time()
+            ];
+
+            $clientAction = [
+                'type' => 'cast_sdk',
+                'action' => $actionNorm === 'say' ? 'announce' : $actionNorm,
+                'target' => $devName,
+                'deviceId' => $devId,
+                'url' => $streamUrl,
+                'contentType' => $contentType,
+                'title' => $title,
+                'subtitle' => $subtitle,
+                'imageUrl' => $imageUrl,
+                'audioTracks' => [[
+                    'url' => $streamUrl,
+                    'contentType' => $contentType,
+                    'title' => $title,
+                    'artist' => $subtitle,
+                    'album' => '',
+                    'imageUrl' => $imageUrl,
+                    'streamType' => 'BUFFERED'
+                ]]
+            ];
+
+            $updated = $store->updateDevice($devId, [
+                'status' => 'PLAYING',
+                'appId' => 'CC1AD845',
+                'appName' => 'Default Media Receiver',
+                'media' => $optimisticMedia,
+                'mediaSyncAt' => time()
+            ]);
+
+            return [
+                'ok' => true,
+                'action' => $actionNorm === 'say' ? 'announce' : $actionNorm,
+                'playbackMethod' => 'browser_cast_bridge',
+                'clientSideRequired' => true,
+                'clientAction' => $clientAction,
+                'device' => $updated,
+                'media' => $optimisticMedia
+            ];
+        }
+
+        // 3. Volume & Transport Controls (Cloud YouTube Lounge + Browser Cast Bridge)
+        $curVol = isset($target['volume']) ? (float)$target['volume'] : 0.5;
+        $curMuted = !empty($target['muted']);
+        $lvl = $curVol;
+        $m = $curMuted;
+        if (in_array($actionNorm, ['set_volume', 'volume_up', 'volume_down', 'mute', 'unmute', 'toggle_mute'], true)) {
+            if ($actionNorm === 'volume_up' || $actionNorm === 'volume_down') {
+                $step = isset($mediaOpts['step']) ? abs((float)$mediaOpts['step']) : 0.10;
+                if ($step > 1.0) $step /= 100.0;
+                $lvl = max(0.0, min(1.0, $curVol + ($actionNorm === 'volume_up' ? $step : -$step)));
+                $m = false;
+            } elseif ($actionNorm === 'toggle_mute') {
+                $m = !$curMuted;
+            } else {
+                if ($volume !== null) {
+                    $lvl = max(0.0, min(1.0, $volume > 1.0 ? ($volume / 100.0) : $volume));
+                }
+                if ($actionNorm === 'mute') $m = true;
+                elseif ($actionNorm === 'unmute') $m = false;
+                elseif ($muted !== null) $m = $muted;
+            }
+        }
+
+        $loungeHandled = false;
+        if (!empty($candidates)) {
+            $loungeOpts = $mediaOpts;
+            $loungeOpts['volumePct'] = $m ? 0 : round($lvl * 100);
+            $loungeOpts['currentTime'] = (float)($target['media']['currentTime'] ?? 0.0);
+            foreach ($candidates as $cand) {
+                $lRes = CastV2::controlYouTubeLoungeCloud($cand['screenId'], $cand['theme'], $actionNorm, $loungeOpts);
+                if (!empty($lRes['ok'])) {
+                    $loungeHandled = true;
+                    break;
+                }
+            }
+        }
+
+        $patch = ['mediaSyncAt' => time()];
+        if (in_array($actionNorm, ['set_volume', 'volume_up', 'volume_down', 'mute', 'unmute', 'toggle_mute'], true)) {
+            $patch['volume'] = round($lvl, 2);
+            $patch['muted'] = (bool)$m;
+        } elseif ($actionNorm === 'pause') {
+            $patch['status'] = 'PAUSED';
+            if (!empty($target['media'])) {
+                $patch['media'] = array_merge($target['media'], ['playerState' => 'PAUSED', 'updatedAt' => time()]);
+            }
+        } elseif ($actionNorm === 'play') {
+            $patch['status'] = 'PLAYING';
+            if (!empty($target['media'])) {
+                $patch['media'] = array_merge($target['media'], ['playerState' => 'PLAYING', 'updatedAt' => time()]);
+            }
+        } elseif (in_array($actionNorm, ['stop', 'stop_media'], true)) {
+            $patch['status'] = 'IDLE';
+            $patch['media'] = null;
+        }
+        $updated = $store->updateDevice($devId, $patch);
+
+        $requestedAppKey = str_replace([' ', '-'], '_', strtolower(trim((string)($mediaOpts['app'] ?? ''))));
+        $launchAppId = CastV2::KNOWN_APPS[$requestedAppKey]['appId'] ?? '';
+        if ($launchAppId === '' && preg_match('/^[A-F0-9]{8}$/i', $requestedAppKey)) {
+            $launchAppId = strtoupper($requestedAppKey);
+        }
+        if ($launchAppId === '') {
+            $launchAppId = $target['mdxAppId'] ?? ($isDisplay ? '233637DE' : '2DB7CC49');
+        }
+        if ($launchAppId === '233637DE' && !$isDisplay && stripos((string)$devName, 'knowhere') !== false) {
+            $launchAppId = '2DB7CC49';
+        }
+
+        $clientAction = [
+            'type' => 'cast_sdk',
+            'action' => $actionNorm === 'volume_up' || $actionNorm === 'volume_down' ? 'set_volume' : $actionNorm,
+            'target' => $devName,
+            'deviceId' => $devId,
+            'volume' => round($lvl * 100),
+            'muted' => (bool)$m,
+            'seconds' => $mediaOpts['seconds'] ?? null,
+            'positionSeconds' => $mediaOpts['position_seconds'] ?? null,
+            'app' => $mediaOpts['app'] ?? null,
+            'launchAppId' => $launchAppId,
+            'mdxScreenId' => $target['mdxScreenId'] ?? '',
+            'mdxTheme' => $target['mdxTheme'] ?? ($isDisplay ? 'cl' : 'm'),
+            'mdxAppId' => $target['mdxAppId'] ?? ($isDisplay ? '233637DE' : '2DB7CC49')
+        ];
+
+        return [
+            'ok' => true,
+            'action' => $actionNorm,
+            'playbackMethod' => $loungeHandled ? 'youtube_lounge_cloud' : 'browser_cast_bridge',
+            'clientSideRequired' => !$loungeHandled,
+            'clientAction' => $clientAction,
+            'device' => $updated,
+            'media' => $updated['media'] ?? null,
+            'volume' => ['level' => round($lvl, 2), 'muted' => (bool)$m]
+        ];
     }
 }

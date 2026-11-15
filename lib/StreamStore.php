@@ -192,7 +192,8 @@ class StreamStore
             ];
         }
 
-        $devices = $this->readDiskCastDevices();
+        $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
+        $devices = $isLocalEnv ? $this->readDiskCastDevices() : [];
         if (isset($incoming['devices']) && is_array($incoming['devices'])) {
             foreach ($incoming['devices'] as $k => $dev) {
                 if (!is_array($dev)) continue;
@@ -201,6 +202,9 @@ class StreamStore
                 $dev['id'] = $id;
                 $devices[$id] = array_merge($devices[$id] ?? [], $dev);
             }
+        }
+        if ($isLocalEnv && !empty($devices)) {
+            $this->writeDiskCastDevices($devices);
         }
 
         $vault = [
@@ -342,11 +346,21 @@ class StreamStore
         });
     }
 
+    public static function defaultCastDevicesSeed(): array
+    {
+        return [];
+    }
+
     private function readDiskCastDevices(): array
     {
+        if (class_exists('NetworkHelper') && !NetworkHelper::isLocalEnvironment()) {
+            return [];
+        }
         return $this->withJsonLock('cast_devices', false, function () {
             $data = $this->readJsonFileRaw($this->castDevicesFile);
-            if (!is_array($data)) return [];
+            if (!is_array($data) || empty($data)) {
+                return [];
+            }
             $out = [];
             foreach ($data as $k => $dev) {
                 if (!is_array($dev)) continue;
@@ -388,20 +402,32 @@ class StreamStore
         $v['devices'] = $devicesById;
         $v['hydrated'] = true;
         $this->writeVault($v);
-        $this->writeDiskCastDevices($devicesById);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices($devicesById);
+        }
         return $devicesById;
     }
 
-    public function mergeDiscoveredDevices(array $discoveredList): array
+    public function mergeDiscoveredDevices(array $discoveredList, bool $pruneMissingAuto = false): array
     {
         $v = $this->readVault();
         $existing = is_array($v['devices'] ?? null) && !empty($v['devices'])
             ? $v['devices']
             : $this->readDiskCastDevices();
         $now = time();
+        $discoveredIds = [];
+        foreach ($discoveredList as $d) {
+            if (!empty($d['id'])) {
+                $discoveredIds[(string)$d['id']] = true;
+            }
+        }
 
         foreach ($existing as $id => &$dev) {
-            if (empty($dev['isManual'])) {
+            if ($pruneMissingAuto && empty($dev['isManual']) && empty($dev['isSdkOnly']) && !isset($discoveredIds[$id])) {
+                unset($existing[$id]);
+                continue;
+            }
+            if (empty($dev['isManual']) && empty($dev['isSdkOnly'])) {
                 $dev['online'] = ($now - ($dev['lastSeen'] ?? 0)) < 180;
             }
         }
@@ -413,6 +439,7 @@ class StreamStore
             $existing[$id] = array_merge($prev, $d, [
                 'lastSeen' => $now,
                 'online' => true,
+                'isSdkOnly' => false,
                 'status' => $prev['status'] ?? 'IDLE',
                 'volume' => $prev['volume'] ?? 0.7,
                 'muted' => $prev['muted'] ?? false
@@ -422,7 +449,9 @@ class StreamStore
         $v['devices'] = $existing;
         $v['hydrated'] = true;
         $this->writeVault($v);
-        $this->writeDiskCastDevices($existing);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices($existing);
+        }
         return $existing;
     }
 
@@ -436,8 +465,83 @@ class StreamStore
         $devices[$id] = array_merge($devices[$id], $patch);
         $v['devices'] = $devices;
         $this->writeVault($v);
-        $this->writeDiskCastDevices($devices);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices($devices);
+        }
         return $devices[$id];
+    }
+
+    public function registerSdkDevice(array $info): array
+    {
+        $name = trim((string)($info['name'] ?? ($info['friendlyName'] ?? 'Google Cast Device')));
+        if ($name === '') {
+            $name = 'Google Cast Device';
+        }
+        $kind = (($info['kind'] ?? '') === 'display') ? 'display' : 'speaker';
+        $rawSdkId = trim((string)($info['deviceId'] ?? ($info['id'] ?? '')));
+        $sdkId = $rawSdkId !== ''
+            ? 'sdk-' . self::sanitizeId($rawSdkId, substr(sha1(strtolower($name)), 0, 12))
+            : 'sdk-' . substr(sha1(strtolower($name . '|' . $kind)), 0, 16);
+
+        $v = $this->readVault();
+        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
+            ? $v['devices']
+            : $this->readDiskCastDevices();
+
+        // Reuse matching existing device by exact case-insensitive name if present on this Wi-Fi
+        $targetId = $sdkId;
+        foreach ($devices as $exId => $exDev) {
+            if (strcasecmp(trim((string)($exDev['name'] ?? '')), $name) === 0) {
+                $targetId = (string)$exId;
+                break;
+            }
+        }
+
+        $prev = $devices[$targetId] ?? [];
+        $isDiskless = empty($prev['host']);
+        $model = trim((string)($info['model'] ?? ($info['modelName'] ?? '')));
+        if ($model === '') {
+            $model = $prev['model'] ?? ($kind === 'display' ? 'Chromecast / Google TV (Wi-Fi SDK)' : 'Google Nest Speaker (Wi-Fi SDK)');
+        }
+        $isGroup = str_contains(strtolower($model), 'group');
+        $defaultTheme = $kind === 'display' ? 'cl' : 'm';
+        $defaultAppId = ($kind === 'display' && !$isGroup) ? '233637DE' : '2DB7CC49';
+
+        $entry = array_merge($prev, [
+            'id' => $targetId,
+            'name' => $name,
+            'model' => $model,
+            'host' => $prev['host'] ?? '',
+            'port' => $prev['port'] ?? 8009,
+            'capabilities' => $prev['capabilities'] ?? ($kind === 'display' ? 201221 : 198660),
+            'kind' => $kind,
+            'supportsVideo' => $kind === 'display',
+            'supportsAudio' => true,
+            'online' => true,
+            'isManual' => !empty($prev['isManual']),
+            'isSdkOnly' => $isDiskless,
+            'sdkDeviceId' => $rawSdkId,
+            'status' => strtoupper(trim((string)($info['status'] ?? ($prev['status'] ?? 'ACTIVE')))),
+            'volume' => isset($info['volume']) && is_numeric($info['volume'])
+                ? max(0.0, min(1.0, (float)$info['volume']))
+                : ($prev['volume'] ?? 0.7),
+            'muted' => isset($info['muted']) ? !empty($info['muted']) : !empty($prev['muted']),
+            'mdxTheme' => trim((string)($info['mdxTheme'] ?? ($prev['mdxTheme'] ?? $defaultTheme))) ?: $defaultTheme,
+            'mdxAppId' => trim((string)($info['mdxAppId'] ?? ($prev['mdxAppId'] ?? $defaultAppId))) ?: $defaultAppId,
+            'lastSeen' => time()
+        ]);
+        if (!empty($info['mdxScreenId'])) {
+            $entry['mdxScreenId'] = trim((string)$info['mdxScreenId']);
+        }
+
+        $devices[$targetId] = $entry;
+        $v['devices'] = $devices;
+        $v['hydrated'] = true;
+        $this->writeVault($v);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices($devices);
+        }
+        return $entry;
     }
 
     public function addManualDevice(string $name, string $host, int $port = 8009, string $kind = 'speaker'): array
@@ -471,7 +575,9 @@ class StreamStore
         $v['devices'] = $devices;
         $v['hydrated'] = true;
         $this->writeVault($v);
-        $this->writeDiskCastDevices($devices);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices($devices);
+        }
         return $devices[$id];
     }
 
@@ -484,7 +590,9 @@ class StreamStore
         unset($devices[$id]);
         $v['devices'] = $devices;
         $this->writeVault($v);
-        $this->writeDiskCastDevices($devices);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices($devices);
+        }
     }
 
     // =========================================================================

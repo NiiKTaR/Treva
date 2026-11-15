@@ -227,7 +227,7 @@ try {
         $snap = buildSceneSnapshot($store);
         echo json_encode(withSessionVault($store, [
             'ok' => true,
-            'devices' => NetworkHelper::isLocalEnvironment() ? array_values($store->getDevices()) : [],
+            'devices' => array_values($store->getDevices()),
             'smartConfig' => $store->getSmartConfigPublic(),
             'smartDevices' => $store->getSmartDevicesPublic(),
             'smartScenes' => $store->getSmartScenes(),
@@ -269,7 +269,9 @@ try {
         }
 
         $isLocal = NetworkHelper::isLocalEnvironment();
-        $devices = $isLocal ? SmartController::syncAllCastDevices($store, 1.2, true, 6) : [];
+        $devices = $isLocal
+            ? SmartController::syncAllCastDevices($store, 1.2, true, 6)
+            : array_values($store->getDevices());
         $endpoints = buildStreamUrls($sid, $selectedLanIp);
         $snap = buildSceneSnapshot($store);
 
@@ -299,12 +301,11 @@ try {
     // 4. Lightweight State Polling
     // -------------------------------------------------------------------------
     if ($action === 'state') {
-        $isLocal = NetworkHelper::isLocalEnvironment();
         echo json_encode([
             'ok' => true,
             'sessionHydrated' => $store->hasSessionVaultData(),
             'streamStatus' => $store->getStreamStatus($sid),
-            'devices' => $isLocal ? array_values($store->getDevices()) : [],
+            'devices' => array_values($store->getDevices()),
             'smartDevices' => $store->getSmartDevicesPublic()
         ]);
         exit;
@@ -338,16 +339,68 @@ try {
     // 6. Google Cast Local LAN Discovery & Control
     // -------------------------------------------------------------------------
     if ($action === 'discover') {
-        if (!NetworkHelper::isLocalEnvironment()) {
-            echo json_encode(['ok' => true, 'remoteHosting' => true, 'devices' => []]);
-            exit;
+        $isLocal = NetworkHelper::isLocalEnvironment();
+        if ($isLocal) {
+            $settings = $store->getSettings();
+            $bindIp = $settings['selectedLanIp'] ?? '';
+            $found = CastMdns::discover($bindIp, 1.5);
+            $store->mergeDiscoveredDevices($found, true);
+            $synced = SmartController::syncAllCastDevices($store, 1.4, false);
+        } else {
+            $synced = array_values($store->getDevices());
         }
-        $settings = $store->getSettings();
-        $bindIp = $settings['selectedLanIp'] ?? '';
-        $found = CastMdns::discover($bindIp, 1.5);
-        $store->mergeDiscoveredDevices($found);
-        $synced = SmartController::syncAllCastDevices($store, 1.4, false);
-        echo json_encode(withSessionVault($store, ['ok' => true, 'devices' => $synced]));
+        echo json_encode(withSessionVault($store, [
+            'ok' => true,
+            'remoteHosting' => !$isLocal,
+            'devices' => $synced
+        ]));
+        exit;
+    }
+
+    if ($action === 'register_sdk_device') {
+        $body = readJsonBody();
+        $dev = $store->registerSdkDevice($body);
+        echo json_encode(withSessionVault($store, [
+            'ok' => true,
+            'device' => $dev,
+            'devices' => array_values($store->getDevices())
+        ]));
+        exit;
+    }
+
+    if ($action === 'lan_diag_sync') {
+        $body = readJsonBody();
+        $castEndpoints = is_array($body['castDevices'] ?? null) ? $body['castDevices'] : [];
+        $smartEndpoints = is_array($body['smartDevices'] ?? null) ? $body['smartDevices'] : [];
+        foreach ($castEndpoints as $ep) {
+            if (!is_array($ep)) continue;
+            $host = trim((string)($ep['host'] ?? ''));
+            if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) continue;
+            $port = (int)($ep['port'] ?? 8009);
+            $name = trim((string)($ep['name'] ?? '')) ?: "Cast Device ({$host})";
+            $kind = in_array($ep['kind'] ?? '', ['speaker', 'display'], true) ? $ep['kind'] : 'display';
+            $store->addManualDevice($name, $host, $port > 0 ? $port : 8009, $kind);
+        }
+        foreach ($smartEndpoints as $sep) {
+            if (!is_array($sep)) continue;
+            $ip = trim((string)($sep['ip'] ?? ''));
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) continue;
+            $platform = strtolower(trim((string)($sep['platform'] ?? 'magichome')));
+            $name = trim((string)($sep['name'] ?? '')) ?: ($platform === 'tuya' ? "SmartLife ({$ip})" : "MagicHome ({$ip})");
+            $store->upsertSmartDevice([
+                'id' => ($sep['id'] ?? '') ?: ($platform . '_' . str_replace('.', '_', $ip)),
+                'name' => $name,
+                'platform' => $platform,
+                'ip' => $ip,
+                'category' => $sep['category'] ?? 'light',
+                'online' => true
+            ]);
+        }
+        echo json_encode(withSessionVault($store, [
+            'ok' => true,
+            'devices' => array_values($store->getDevices()),
+            'smartDevices' => $store->getSmartDevicesPublic()
+        ]));
         exit;
     }
 
@@ -429,56 +482,53 @@ try {
     if ($action === 'cast_stop') {
         $body = readJsonBody();
         $deviceId = $body['deviceId'] ?? '';
-        $devices = $store->getDevices();
-        if (!isset($devices[$deviceId])) {
-            http_response_code(404);
-            echo json_encode(['error' => 'Cast device not found']);
-            exit;
-        }
-        $dev = $devices[$deviceId];
-        $cast = new CastV2();
-        try {
-            $cast->connect($dev['host'], (int)$dev['port'], 4.0);
-            $cast->stopCurrentApp();
-            $cast->close();
-        } catch (Throwable $ex) {
-            $cast->close();
-        }
-        $updated = $store->updateDevice($deviceId, [
-            'status' => 'IDLE',
-            'appId' => null,
-            'appName' => null,
-            'media' => null,
-            'activeStreamMode' => null,
-            'mediaSyncAt' => time()
-        ]);
-        echo json_encode(['ok' => true, 'device' => $updated]);
+        $res = SmartController::controlCast($store, (string)$deviceId, 'stop');
+        echo json_encode($res);
         exit;
     }
 
     if ($action === 'cast_volume') {
         $body = readJsonBody();
         $deviceId = $body['deviceId'] ?? '';
-        $devices = $store->getDevices();
-        if (!isset($devices[$deviceId])) {
-            http_response_code(404);
-            echo json_encode(['error' => 'Cast device not found']);
-            exit;
-        }
-        $dev = $devices[$deviceId];
         $level = isset($body['level']) ? (float)$body['level'] : null;
         $muted = isset($body['muted']) ? (bool)$body['muted'] : null;
+        $volAct = $level !== null ? 'set_volume' : ($muted === true ? 'mute' : ($muted === false ? 'unmute' : 'set_volume'));
+        $res = SmartController::controlCast($store, (string)$deviceId, $volAct, $level, $muted);
+        echo json_encode($res);
+        exit;
+    }
 
-        $cast = new CastV2();
-        $cast->connect($dev['host'], (int)$dev['port'], 4.0);
-        $vol = $cast->setVolume($level, $muted);
-        $cast->close();
-
-        $updated = $store->updateDevice($deviceId, [
-            'volume' => isset($vol['level']) ? round((float)$vol['level'], 2) : ($dev['volume'] ?? 0.7),
-            'muted' => !empty($vol['muted'])
-        ]);
-        echo json_encode(['ok' => true, 'volume' => $vol, 'device' => $updated]);
+    if ($action === 'cast_lounge_play') {
+        $body = readJsonBody();
+        $deviceId = trim((string)($body['deviceId'] ?? ''));
+        $screenId = trim((string)($body['screenId'] ?? ''));
+        $theme = trim((string)($body['theme'] ?? 'cl')) ?: 'cl';
+        $videoIds = is_array($body['videoIds'] ?? null) ? $body['videoIds'] : [];
+        $listId = trim((string)($body['listId'] ?? ''));
+        if ($deviceId !== '' && $screenId !== '') {
+            $store->updateDevice($deviceId, [
+                'mdxScreenId' => $screenId,
+                'mdxTheme' => $theme,
+                'mdxAppId' => $theme === 'm' ? '2DB7CC49' : '233637DE'
+            ]);
+        }
+        $res = CastV2::playYouTubeLoungeCloud($screenId, $theme, $videoIds, $listId);
+        if (!empty($res['ok']) && $deviceId !== '') {
+            $usedTheme = (string)($res['theme'] ?? $theme);
+            $appId = $usedTheme === 'm' ? '2DB7CC49' : '233637DE';
+            $appName = $usedTheme === 'm' ? 'YouTube Music' : 'YouTube';
+            $res['device'] = $store->updateDevice($deviceId, [
+                'status' => 'PLAYING',
+                'appId' => $appId,
+                'appName' => $appName,
+                'mdxScreenId' => $screenId,
+                'mdxTheme' => $usedTheme,
+                'mdxAppId' => $appId,
+                'mediaSyncAt' => time()
+            ]);
+            $res['devices'] = array_values($store->getDevices());
+        }
+        echo json_encode($res);
         exit;
     }
 
@@ -500,7 +550,7 @@ try {
         $onlyStale = !empty($_GET['fast']);
         $synced = NetworkHelper::isLocalEnvironment()
             ? SmartController::syncAllCastDevices($store, 1.4, $onlyStale, 4)
-            : [];
+            : array_values($store->getDevices());
         echo json_encode(['ok' => true, 'devices' => $synced]);
         exit;
     }
@@ -726,7 +776,7 @@ try {
         $warning = null;
 
         if ($ip !== '' && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            throw new InvalidArgumentException('Wi-Fi IP must be a valid IPv4 address (e.g. 192.168.100.6)');
+            throw new InvalidArgumentException('Wi-Fi IP must be a valid IPv4 address (e.g. 192.168.1.50)');
         }
 
         if ($platform === 'magichome') {
@@ -957,7 +1007,7 @@ try {
             'result' => $result,
             'clientActions' => $clientActions,
             'smartDevices' => $store->getSmartDevicesPublic(),
-            'devices' => NetworkHelper::isLocalEnvironment() ? array_values($store->getDevices()) : []
+            'devices' => array_values($store->getDevices())
         ]);
         exit;
     }
