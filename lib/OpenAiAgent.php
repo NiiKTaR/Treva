@@ -1002,7 +1002,10 @@ PROMPT;
                 'output_modalities' => ['audio'],
                 'audio' => [
                     'input' => [
-                        'transcription' => ['model' => 'gpt-4o-mini-transcribe'],
+                        'transcription' => [
+                            'model' => 'gpt-4o-mini-transcribe',
+                            'prompt' => 'Treva, Hola Treva, Hello Treva, Chau Treva, Goodbye Treva, Alice, Rabbit, Knowhere'
+                        ],
                         'noise_reduction' => ['type' => 'near_field'],
                         'turn_detection' => [
                             'type' => 'server_vad',

@@ -115,127 +115,159 @@ class CastMdns
             return;
         }
 
-        $candidateIps = [];
+        $priorityIps = [];
+        $restIps = [];
         foreach ($prefixesToScan as $prefix) {
             for ($hostOctet = 1; $hostOctet <= 254; $hostOctet++) {
                 $candidateIp = $prefix . '.' . $hostOctet;
-                if (!isset($localIpSet[$candidateIp])) {
-                    $candidateIps[] = $candidateIp;
+                if (isset($localIpSet[$candidateIp])) {
+                    continue;
+                }
+                if ($hostOctet >= 2 && $hostOctet <= 35) {
+                    $priorityIps[] = $candidateIp;
+                } else {
+                    $restIps[] = $candidateIp;
                 }
             }
         }
-        if (empty($candidateIps)) {
+        if (empty($priorityIps) && empty($restIps)) {
             return;
         }
 
-        $batchSize = 64;
-        foreach (array_chunk($candidateIps, $batchSize) as $batch) {
-            $mh = curl_multi_init();
-            if ($mh === false) {
-                continue;
-            }
-            $handles = [];
-            foreach ($batch as $ip) {
-                $ch = curl_init('http://' . $ip . ':8008/setup/eureka_info?params=name,detail,device_info,net,wifi');
-                if ($ch === false) {
+        $probeBatches = function (array $ips, int $chunkSize, int $connectMs, int $totalMs) use (&$services): int {
+            $foundInPass = 0;
+            foreach (array_chunk($ips, $chunkSize) as $batch) {
+                $mh = curl_multi_init();
+                if ($mh === false) {
                     continue;
                 }
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_CONNECTTIMEOUT_MS => 320,
-                    CURLOPT_TIMEOUT_MS => 520,
-                    CURLOPT_NOSIGNAL => 1,
-                    CURLOPT_FOLLOWLOCATION => false,
-                ]);
-                curl_multi_add_handle($mh, $ch);
-                $handles[$ip] = $ch;
-            }
-
-            $running = null;
-            do {
-                $status = curl_multi_exec($mh, $running);
-                if ($running) {
-                    curl_multi_select($mh, 0.05);
-                }
-            } while ($running > 0 && $status === CURLM_OK);
-
-            foreach ($handles as $ip => $ch) {
-                $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                $raw = curl_multi_getcontent($ch);
-                curl_multi_remove_handle($mh, $ch);
-                curl_close($ch);
-
-                if ($httpCode !== 200 || !is_string($raw) || $raw === '') {
-                    continue;
-                }
-                $info = json_decode($raw, true);
-                if (!is_array($info)) {
-                    continue;
-                }
-
-                $friendlyName = trim((string)($info['name'] ?? ''));
-                $rawUdn = trim((string)($info['ssdp_udn'] ?? ($info['device_info']['ssdp_udn'] ?? '')));
-                if ($friendlyName === '' && $rawUdn === '') {
-                    continue;
-                }
-                $id = $rawUdn !== '' ? strtolower(str_replace('-', '', $rawUdn)) : ($ip . ':8009');
-                $ssid = trim((string)($info['ssid'] ?? ($info['wifi']['ssid'] ?? '')));
-                $bssid = trim((string)($info['bssid'] ?? ($info['wifi']['bssid'] ?? '')));
-
-                // Preserve existing UDP mDNS metadata (including Cast Groups sharing a host IP); only add Wi-Fi info.
-                if (isset($services[$id])) {
-                    if ($ssid !== '' && empty($services[$id]['ssid'])) {
-                        $services[$id]['ssid'] = $ssid;
+                $handles = [];
+                foreach ($batch as $ip) {
+                    $ch = curl_init('http://' . $ip . ':8008/setup/eureka_info?params=name,detail,device_info,net,wifi');
+                    if ($ch === false) {
+                        continue;
                     }
-                    if ($bssid !== '' && empty($services[$id]['bssid'])) {
-                        $services[$id]['bssid'] = $bssid;
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_CONNECTTIMEOUT_MS => $connectMs,
+                        CURLOPT_TIMEOUT_MS => $totalMs,
+                        CURLOPT_NOSIGNAL => 1,
+                        CURLOPT_FOLLOWLOCATION => false,
+                    ]);
+                    curl_multi_add_handle($mh, $ch);
+                    $handles[$ip] = $ch;
+                }
+
+                $running = null;
+                do {
+                    $status = curl_multi_exec($mh, $running);
+                    if ($running) {
+                        curl_multi_select($mh, 0.05);
                     }
-                    continue;
+                } while ($running > 0 && $status === CURLM_OK);
+
+                foreach ($handles as $ip => $ch) {
+                    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $raw = curl_multi_getcontent($ch);
+                    curl_multi_remove_handle($mh, $ch);
+                    curl_close($ch);
+
+                    if ($httpCode !== 200 || !is_string($raw) || $raw === '') {
+                        continue;
+                    }
+                    $info = json_decode($raw, true);
+                    if (!is_array($info)) {
+                        continue;
+                    }
+
+                    $friendlyName = trim((string)($info['name'] ?? ''));
+                    $rawUdn = trim((string)($info['ssdp_udn'] ?? ($info['device_info']['ssdp_udn'] ?? '')));
+                    if ($friendlyName === '' && $rawUdn === '') {
+                        continue;
+                    }
+                    $foundInPass++;
+                    $id = $rawUdn !== '' ? strtolower(str_replace('-', '', $rawUdn)) : ($ip . ':8009');
+                    $ssid = trim((string)($info['ssid'] ?? ($info['wifi']['ssid'] ?? '')));
+                    $bssid = trim((string)($info['bssid'] ?? ($info['wifi']['bssid'] ?? '')));
+
+                    // Preserve existing UDP mDNS metadata (including Cast Groups sharing a host IP); only add Wi-Fi info.
+                    if (isset($services[$id])) {
+                        if ($ssid !== '' && empty($services[$id]['ssid'])) {
+                            $services[$id]['ssid'] = $ssid;
+                        }
+                        if ($bssid !== '' && empty($services[$id]['bssid'])) {
+                            $services[$id]['bssid'] = $bssid;
+                        }
+                        continue;
+                    }
+
+                    $capsObj = is_array($info['device_info']['capabilities'] ?? null) ? $info['device_info']['capabilities'] : [];
+                    $model = trim((string)($info['detail']['model_name'] ?? ($info['device_info']['model_name'] ?? '')));
+                    $hasDisplayHints = !empty($capsObj['display_supported'])
+                        || array_key_exists('closed_caption', $info)
+                        || !empty($info['hdmi_control']);
+                    if ($model === '') {
+                        $model = $hasDisplayHints ? 'Chromecast' : 'Google Cast Speaker';
+                    }
+
+                    if ($hasDisplayHints) {
+                        $capabilities = 5;
+                    } else {
+                        $capabilities = !empty($capsObj['multizone_supported']) ? 4 : (self::classifyDevice($model, 0) === 'display' ? 5 : 4);
+                    }
+
+                    $kind = self::classifyDevice($model, $capabilities);
+                    $variant = self::classifyVariant($model, $capabilities);
+
+                    $entry = [
+                        'id' => $id,
+                        'name' => $friendlyName !== '' ? $friendlyName : ('Cast ' . $ip),
+                        'model' => $model,
+                        'variant' => $variant,
+                        'host' => $ip,
+                        'port' => 8009,
+                        'capabilities' => $capabilities,
+                        'kind' => $kind,
+                        'supportsVideo' => $kind === 'display',
+                        'supportsAudio' => true,
+                        'mdnsStatusText' => null,
+                        'online' => true,
+                        'isManual' => false,
+                    ];
+                    if ($ssid !== '') {
+                        $entry['ssid'] = $ssid;
+                    }
+                    if ($bssid !== '') {
+                        $entry['bssid'] = $bssid;
+                    }
+                    $services[$id] = $entry;
                 }
 
-                $capsObj = is_array($info['device_info']['capabilities'] ?? null) ? $info['device_info']['capabilities'] : [];
-                $model = trim((string)($info['detail']['model_name'] ?? ($info['device_info']['model_name'] ?? '')));
-                $hasDisplayHints = !empty($capsObj['display_supported'])
-                    || array_key_exists('closed_caption', $info)
-                    || !empty($info['hdmi_control']);
-                if ($model === '') {
-                    $model = $hasDisplayHints ? 'Chromecast' : 'Google Cast Speaker';
-                }
-
-                if ($hasDisplayHints) {
-                    $capabilities = 5;
-                } else {
-                    $capabilities = !empty($capsObj['multizone_supported']) ? 4 : (self::classifyDevice($model, 0) === 'display' ? 5 : 4);
-                }
-
-                $kind = self::classifyDevice($model, $capabilities);
-                $variant = self::classifyVariant($model, $capabilities);
-
-                $entry = [
-                    'id' => $id,
-                    'name' => $friendlyName !== '' ? $friendlyName : ('Cast ' . $ip),
-                    'model' => $model,
-                    'variant' => $variant,
-                    'host' => $ip,
-                    'port' => 8009,
-                    'capabilities' => $capabilities,
-                    'kind' => $kind,
-                    'supportsVideo' => $kind === 'display',
-                    'supportsAudio' => true,
-                    'mdnsStatusText' => null,
-                    'online' => true,
-                    'isManual' => false,
-                ];
-                if ($ssid !== '') {
-                    $entry['ssid'] = $ssid;
-                }
-                if ($bssid !== '') {
-                    $entry['bssid'] = $bssid;
-                }
-                $services[$id] = $entry;
+                curl_multi_close($mh);
             }
+            return $foundInPass;
+        };
 
-            curl_multi_close($mh);
+        // Pass 1: Priority DHCP range (.2-.35) with generous timeout for waking Wi-Fi power-save radios
+        if (!empty($priorityIps)) {
+            $foundCount = $probeBatches($priorityIps, 34, 650, 950);
+            if ($foundCount < 2) {
+                $knownHosts = [];
+                foreach ($services as $svc) {
+                    if (!empty($svc['host']) && (int)($svc['port'] ?? 8009) === 8009) {
+                        $knownHosts[$svc['host']] = true;
+                    }
+                }
+                $retryIps = array_values(array_filter($priorityIps, static fn($ip) => !isset($knownHosts[$ip])));
+                if (!empty($retryIps)) {
+                    $probeBatches($retryIps, 34, 650, 950);
+                }
+            }
+        }
+
+        // Pass 2: Remaining subnet hosts (.1, .36-.254)
+        if (!empty($restIps)) {
+            $probeBatches($restIps, 64, 320, 520);
         }
     }
 

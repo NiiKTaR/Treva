@@ -24,7 +24,7 @@
   <link rel="icon" type="image/png" sizes="512x512" href="assets/icons/icon-512.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="assets/icons/apple-touch-icon.png" />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(30 12 12)'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(-30 12 12)'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="assets/css/styles.css?v=6.14" />
+  <link rel="stylesheet" href="assets/css/styles.css?v=6.18" />
   <script type="importmap">
     {
       "imports": {
@@ -135,10 +135,10 @@
               </div>
 
               <div class="vos-btn-group" role="group" aria-label="Layer Solo Filter">
-                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn active" data-solo="all">All 3</button>
-                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn" data-solo="v">V</button>
-                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn" data-solo="o">O</button>
-                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn" data-solo="s">S</button>
+                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn active" data-solo="all" title="Show All 3 Tiers (V, O, S)">All 3</button>
+                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn" data-solo="v" title="Visual Layer (V) — Lights &amp; devices showing brightness % or sound level %">V</button>
+                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn" data-solo="o" title="Objective Layer (O) — All smart &amp; IR devices">O</button>
+                <button type="button" class="btn btn-sm btn-secondary vos-solo-btn" data-solo="s" title="Symbolic Layer (S) — System Bus Load">S</button>
               </div>
 
               <button type="button" class="btn btn-sm btn-secondary active" id="vosHelperToggleBtn" title="Toggle 3D Spatial Mouse Helper &amp; Polar Reticle">Probe</button>
@@ -178,7 +178,7 @@
             <div class="vos-tooltip vos-mouse-helper hidden" id="vosTooltip"></div>
 
             <div class="vos-ring-legend">
-              <span class="vos-leg-pill leg-v"><i></i> V // Hardware Output</span>
+              <span class="vos-leg-pill leg-v"><i></i> V // Visual Telemetry &bull; <strong id="vosVisualStats">0 VISUAL</strong></span>
               <span class="vos-leg-pill leg-o"><i></i> O // Objective PnL &bull; <strong id="vosObjectiveStats">0 DEVICES</strong></span>
               <span class="vos-leg-pill leg-s"><i></i> S // System Bus Load</span>
             </div>
@@ -247,6 +247,37 @@
             </div>
 
             <div class="vos-action-banner hidden" id="vosActionBanner"></div>
+
+            <!-- Holographic Wake/Sleep Voice Match Flash Overlay -->
+            <div class="vos-voice-match-flash hidden" id="vosVoiceMatchFlash" role="status" aria-live="assertive">
+              <div class="vos-vmf-ring" aria-hidden="true"></div>
+              <div class="vos-vmf-icon" id="vosVmfIcon">&#9889;</div>
+              <div class="vos-vmf-body">
+                <div class="vos-vmf-kicker" id="vosVmfKicker">ANNYANG + METAPHONE VOICE MATCH</div>
+                <div class="vos-vmf-phrase" id="vosVmfPhrase">&ldquo;Hola Treva&rdquo;</div>
+                <div class="vos-vmf-action" id="vosVmfAction">Voice Link Enabled &bull; Voice Menu Opened</div>
+              </div>
+              <span class="vos-vmf-score" id="vosVmfScore">98% MATCH</span>
+            </div>
+
+            <!-- Persistent Bottom Holographic Voice Match Sentinel & English Instruction Bar -->
+            <div class="vos-voice-sentinel-hud" id="vosVoiceSentinelHud" role="region" aria-label="Voice Wake and Goodbye Instructions">
+              <div class="vos-vs-left">
+                <span class="vos-vs-orb is-listening" id="vosSentinelOrb" aria-hidden="true">
+                  <i class="vos-vs-wave w1"></i>
+                  <i class="vos-vs-wave w2"></i>
+                  <i class="vos-vs-wave w3"></i>
+                </span>
+                <span class="vos-vs-badge" id="vosSentinelStateBadge">VOICE SENTINEL &bull; READY</span>
+              </div>
+              <div class="vos-vs-guide" id="vosSentinelGuideLabel">
+                <strong>Voice Match Guide (EN):</strong> Say <span class="vos-vs-kw wake">&ldquo;Hola Treva&rdquo;</span> or <span class="vos-vs-kw wake">&ldquo;Hello Treva&rdquo;</span> (any language greeting + <em>Treva</em>) to open the Voice Menu &amp; enable the Voice Link &bull; Say <span class="vos-vs-kw sleep">&ldquo;Chau Treva&rdquo;</span> or <span class="vos-vs-kw sleep">&ldquo;Goodbye Treva&rdquo;</span> (any language goodbye) to stop the Voice Link &amp; hide the Voice Menu.
+              </div>
+              <div class="vos-vs-right">
+                <span class="vos-vs-match-chip" id="vosSentinelMatchChip" title="Zero-false-positive phonetic voice matcher">ANNYANG + METAPHONE</span>
+                <button type="button" class="vos-vs-toggle-btn active" id="vosSentinelToggleBtn" title="Toggle hands-free wake/goodbye voice detection">Wake Mic ON</button>
+              </div>
+            </div>
           </div>
           <div class="toast-container vos-fs-toast-container" id="vosToastContainer" aria-live="polite"></div>
         </section>
@@ -285,6 +316,13 @@
               <button type="button" class="btn btn-primary btn-sm" id="aiVoiceToggleBtn">Activate Voice Agent</button>
               <button type="button" class="btn btn-secondary btn-sm hidden" id="aiToggleLogBtn" title="Show or hide assistant transcript">Hide Log</button>
             </div>
+          </div>
+
+          <div class="ai-voice-match-menu-banner" id="aiVoiceMatchMenuBanner">
+            <span class="ai-vmm-dot"></span>
+            <span class="ai-vmm-text">
+              <strong>Hands-Free Voice Match:</strong> Say <code>&ldquo;Hola Treva&rdquo;</code> / <code>&ldquo;Hello Treva&rdquo;</code> (any language greeting + Treva) to connect &amp; open &bull; Say <code>&ldquo;Chau Treva&rdquo;</code> / <code>&ldquo;Goodbye Treva&rdquo;</code> (or any goodbye in any language) to stop the Voice Link and hide this menu.
+            </span>
           </div>
 
           <form class="ai-input-row" id="aiTextForm">
@@ -345,7 +383,7 @@
             <div class="vos-holo-deck" id="vosHoloDeck">
               <div class="vos-deck-panel vos-deck-nav">
                 <div class="vos-deck-title">
-                  <span>SECTOR MATRIX // TIER O</span>
+                  <span id="vosSectorMatrixTitle">SECTOR MATRIX // TIER O</span>
                   <span class="vos-deck-hint">Click pill or 3D tube</span>
                 </div>
                 <div class="vos-device-nav" id="vosDeviceNav"></div>
@@ -868,8 +906,9 @@
   <div class="toast-container" id="toastContainer"></div>
 
   <script src="assets/js/qrcode.js"></script>
-  <script type="module" src="assets/js/vos-3d.js?v=6.14"></script>
-  <script defer src="assets/js/app.js?v=6.14"></script>
-  <script defer src="assets/js/pwa.js?v=6.14"></script>
+  <script type="module" src="assets/js/vos-3d.js?v=6.18"></script>
+  <script defer src="assets/js/treva-voice-match.js?v=6.18"></script>
+  <script defer src="assets/js/app.js?v=6.18"></script>
+  <script defer src="assets/js/pwa.js?v=6.18"></script>
 </body>
 </html>

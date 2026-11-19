@@ -2607,6 +2607,57 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     return out;
   }
 
+  function isVisualLayerDevice(dev) {
+    if (!dev) return false;
+    const cat = String(dev.category || '').toLowerCase();
+    // IR devices (ir_ac, ir_tv, ir_audio, ir_fan, ir_purifier, ir_remote) have no visual interface -> Objective (O) tab only
+    if (cat.startsWith('ir_') || cat === 'ir' || dev.isIr || dev.remoteType) {
+      return false;
+    }
+    // Lights (brightness % + RGB) and Google Cast sinks (sound/volume level %) are Visual (V) devices
+    if (cat === 'light' || cat === 'ble_light' || dev._kind === 'ble') {
+      return true;
+    }
+    if (dev._kind === 'cast' || cat === 'cast') {
+      return true;
+    }
+    // Any non-IR device exposing a live numeric percentage metric (brightness % or sound/volume level %)
+    if (typeof dev.brightness === 'number' && Number.isFinite(dev.brightness)) {
+      return true;
+    }
+    if (typeof dev.volume === 'number' && Number.isFinite(dev.volume)) {
+      return true;
+    }
+    if (typeof dev.soundLevel === 'number' && Number.isFinite(dev.soundLevel)) {
+      return true;
+    }
+    return false;
+  }
+
+  function getDeviceVisualMetricLabel(dev) {
+    if (!dev || !isVisualLayerDevice(dev)) return '';
+    const cat = String(dev.category || '').toLowerCase();
+    if (dev._kind === 'cast' || cat === 'cast') {
+      const vol = Math.round(clamp(Number(dev.brightness ?? 70), 0, 100));
+      return `${vol}% Vol`;
+    }
+    if (cat === 'light' || cat === 'ble_light' || dev._kind === 'ble') {
+      const bri = Math.round(clamp(Number(dev.brightness ?? 100), 0, 100));
+      return `${bri}% Bri`;
+    }
+    if (typeof dev.volume === 'number' && Number.isFinite(dev.volume)) {
+      const vol = dev.volume <= 1 ? Math.round(dev.volume * 100) : Math.round(dev.volume);
+      return `${clamp(vol, 0, 100)}% Vol`;
+    }
+    if (typeof dev.soundLevel === 'number' && Number.isFinite(dev.soundLevel)) {
+      return `${Math.round(clamp(dev.soundLevel, 0, 100))}% Vol`;
+    }
+    if (typeof dev.brightness === 'number' && Number.isFinite(dev.brightness)) {
+      return `${Math.round(clamp(dev.brightness, 0, 100))}%`;
+    }
+    return '';
+  }
+
   function buildSystemSlicesMeta() {
     tickSystemUsageRuntime(Date.now());
     const usage = ensureSysUsage();
@@ -2834,8 +2885,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
   function rebuildPieTopology(force = false) {
     const devs = getUnifiedDevices();
+    const visualDevs = devs.filter((d) => isVisualLayerDevice(d));
     const sysMeta = buildSystemSlicesMeta();
-    const sig = devs.map((d) => `${d.id}:${d.category}:${d.name}`).join('|');
+    const sig = devs.map((d) => `${d.id}:${d.category}:${d.name}:${isVisualLayerDevice(d) ? 'v1' : 'v0'}`).join('|');
 
     if (!force && sig === devTopologySig) {
       updateSliceDynamicData(devs, sysMeta);
@@ -2857,56 +2909,72 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       state.selectedDeviceId = devs[0].id;
     }
 
-    // Build Layer V (Inner Ring r=0.92..1.92) and Layer O (Middle Ring r=2.12..3.24)
-    const count = Math.max(1, devs.length);
-    const gap = Math.min(0.048, (TAU / count) * 0.14);
-    const step = TAU / count;
+    // Build Layer V (Inner Ring r=0.92..1.92) — ONLY Visual devices (Lights & devices showing % brightness or % sound level; excludes IR devices)
+    if (visualDevs.length > 0) {
+      const vCount = visualDevs.length;
+      const vGap = Math.min(0.048, (TAU / vCount) * 0.14);
+      const vStep = TAU / vCount;
 
-    for (let i = 0; i < devs.length; i++) {
-      const dev = devs[i];
-      const a0 = i * step + gap * 0.5;
-      const a1 = (i + 1) * step - gap * 0.5;
-      const aMid = (a0 + a1) * 0.5;
-      const col = rgbNormFromDev(dev);
+      for (let i = 0; i < visualDevs.length; i++) {
+        const dev = visualDevs[i];
+        const a0 = i * vStep + vGap * 0.5;
+        const a1 = (i + 1) * vStep - vGap * 0.5;
+        const aMid = (a0 + a1) * 0.5;
+        const col = rgbNormFromDev(dev);
 
-      const vSlice = {
-        key: `v:${dev.id}`,
-        layer: 'v',
-        devId: dev.id,
-        dev,
-        index: i,
-        rIn: 0.92,
-        rOut: 1.92,
-        a0,
-        a1,
-        aMid,
-        baseColor: col,
-        mesh: createSliceMeshObject('v', 0.92, 1.92, a0, a1, col, i)
-      };
-      if (vSlice.mesh && vSlice.mesh.wedgeMesh) {
-        vSlice.mesh.wedgeMesh.userData.vosSlice = vSlice;
+        const vSlice = {
+          key: `v:${dev.id}`,
+          layer: 'v',
+          devId: dev.id,
+          dev,
+          index: i,
+          rIn: 0.92,
+          rOut: 1.92,
+          a0,
+          a1,
+          aMid,
+          baseColor: col,
+          mesh: createSliceMeshObject('v', 0.92, 1.92, a0, a1, col, i)
+        };
+        if (vSlice.mesh && vSlice.mesh.wedgeMesh) {
+          vSlice.mesh.wedgeMesh.userData.vosSlice = vSlice;
+        }
+        sliceModels.v.push(vSlice);
       }
-      sliceModels.v.push(vSlice);
+    }
 
-      const oCol = objectivePnlColorForDev(dev);
-      const oSlice = {
-        key: `o:${dev.id}`,
-        layer: 'o',
-        devId: dev.id,
-        dev,
-        index: i,
-        rIn: 2.12,
-        rOut: 3.24,
-        a0,
-        a1,
-        aMid,
-        baseColor: oCol,
-        mesh: createSliceMeshObject('o', 2.12, 3.24, a0, a1, oCol, i)
-      };
-      if (oSlice.mesh && oSlice.mesh.wedgeMesh) {
-        oSlice.mesh.wedgeMesh.userData.vosSlice = oSlice;
+    // Build Layer O (Middle Ring r=2.12..3.24) — All Objective devices (including IR devices, switches, vacuum, lights & Cast)
+    if (devs.length > 0) {
+      const oCount = devs.length;
+      const oGap = Math.min(0.048, (TAU / oCount) * 0.14);
+      const oStep = TAU / oCount;
+
+      for (let i = 0; i < devs.length; i++) {
+        const dev = devs[i];
+        const a0 = i * oStep + oGap * 0.5;
+        const a1 = (i + 1) * oStep - oGap * 0.5;
+        const aMid = (a0 + a1) * 0.5;
+        const oCol = objectivePnlColorForDev(dev);
+
+        const oSlice = {
+          key: `o:${dev.id}`,
+          layer: 'o',
+          devId: dev.id,
+          dev,
+          index: i,
+          rIn: 2.12,
+          rOut: 3.24,
+          a0,
+          a1,
+          aMid,
+          baseColor: oCol,
+          mesh: createSliceMeshObject('o', 2.12, 3.24, a0, a1, oCol, i)
+        };
+        if (oSlice.mesh && oSlice.mesh.wedgeMesh) {
+          oSlice.mesh.wedgeMesh.userData.vosSlice = oSlice;
+        }
+        sliceModels.o.push(oSlice);
       }
-      sliceModels.o.push(oSlice);
     }
 
     // Build Layer S (Outer Ring r=3.44..4.28)
@@ -5103,29 +5171,42 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
   function renderDeviceNav() {
     if (!els.deviceNav) return;
-    const devs = getUnifiedDevices();
+    const isVisualTab = state.soloLayer === 'v';
+    if (els.sectorMatrixTitle) {
+      els.sectorMatrixTitle.textContent = isVisualTab
+        ? 'SECTOR MATRIX // TIER V (VISUAL)'
+        : (state.soloLayer === 'o' ? 'SECTOR MATRIX // TIER O (OBJECTIVE)' : 'SECTOR MATRIX // TIER V·O');
+    }
+    const allDevs = getUnifiedDevices();
+    const devs = isVisualTab ? allDevs.filter((d) => isVisualLayerDevice(d)) : allDevs;
     if (!devs.length) {
-      els.deviceNav.innerHTML = '<div class="vos-empty">Discovering smart devices...</div>';
+      els.deviceNav.innerHTML = isVisualTab
+        ? '<div class="vos-empty">No Visual (% brightness / % sound) devices active. Switch to O for IR &amp; Objective devices.</div>'
+        : '<div class="vos-empty">Discovering smart devices...</div>';
       return;
     }
 
     const groups = [
       { label: 'Lights', items: devs.filter((d) => d.category === 'light' || d.category === 'ble_light') },
       { label: 'IR & Home', items: devs.filter((d) => String(d.category || '').startsWith('ir_') || d.category === 'switch') },
-      { label: 'Vac / Cast', items: devs.filter((d) => d.category === 'vacuum' || d._kind === 'cast') }
+      { label: isVisualTab ? 'Cast / Audio' : 'Vac / Cast', items: devs.filter((d) => d.category === 'vacuum' || d._kind === 'cast') }
     ].filter((g) => g.items.length > 0);
 
     els.deviceNav.innerHTML = groups.map((g) => `
       <div class="vos-nav-group">
         <span class="vos-nav-group-lbl">${escapeHtml(g.label)}</span>
         ${g.items.map((d) => {
-          const pnl = getSlicePnlProfile({ layer: 'o', dev: d });
+          const pnl = getSlicePnlProfile({ layer: isVisualTab ? 'v' : 'o', dev: d });
           const c = pnl.rgb;
           const sel = d.id === state.selectedDeviceId ? 'is-selected' : '';
+          const metricLbl = getDeviceVisualMetricLabel(d);
+          const metricHtml = metricLbl
+            ? `<span class="vos-dev-chip-metric" style="margin-left:4px;font-size:0.65rem;opacity:0.88;font-family:'Cascadia Code','Consolas',monospace;color:#7dd3fc;">${escapeHtml(metricLbl)}</span>`
+            : '';
           return `
-            <button type="button" class="vos-dev-chip is-pnl-${pnl.key} ${sel}" data-nav-id="${escapeHtml(d.id)}" title="${escapeHtml(d.name)} (${escapeHtml(categoryLabel(d))} • ${escapeHtml(pnl.label)})">
+            <button type="button" class="vos-dev-chip is-pnl-${pnl.key} ${sel}" data-nav-id="${escapeHtml(d.id)}" data-visual="${isVisualLayerDevice(d) ? '1' : '0'}" title="${escapeHtml(d.name)} (${escapeHtml(categoryLabel(d))}${metricLbl ? ` • ${escapeHtml(metricLbl)}` : ''} • ${escapeHtml(pnl.label)})">
               <span class="vos-dev-chip-dot" style="background:${rgbCss(c, 1)}; box-shadow:0 0 6px ${rgbCss(c, 0.85)};"></span>
-              <span>${escapeHtml(d.name)}</span>
+              <span>${escapeHtml(d.name)}</span>${metricHtml}
             </button>
           `;
         }).join('')}
@@ -5145,8 +5226,13 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     const tuyaOk = Boolean(state.smartConfig?.tuya?.configured);
     const mhOk = Boolean(state.smartConfig?.magicHome?.configured);
     const aiOk = Boolean(state.smartConfig?.openai?.configured);
-    const totalDevs = getUnifiedDevices().length;
-    const onDevs = getUnifiedDevices().filter((d) => d.power).length;
+    const unifiedDevs = getUnifiedDevices();
+    const totalDevs = unifiedDevs.length;
+    const onDevs = unifiedDevs.filter((d) => d.power).length;
+    const visualDevs = unifiedDevs.filter((d) => isVisualLayerDevice(d));
+    if (els.vStatsBadge) {
+      els.vStatsBadge.textContent = `${visualDevs.length} VISUAL`;
+    }
     if (els.oStatsBadge) {
       els.oStatsBadge.textContent = `${totalDevs} DEVICES • ${onDevs} ACTIVE`;
     }
@@ -5980,8 +6066,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       }
     }
 
-    const devs = getUnifiedDevices();
-    const dev = devs.find((d) => d.id === state.selectedDeviceId) || devs[0];
+    const allDevs = getUnifiedDevices();
+    const devs = state.soloLayer === 'v' ? allDevs.filter((d) => isVisualLayerDevice(d)) : allDevs;
+    const dev = devs.find((d) => d.id === state.selectedDeviceId) || devs[0] || allDevs[0];
     if (!dev) {
       els.inspectorBody.innerHTML = '<div class="vos-empty">No devices registered yet. Scan LAN or sync Smart Life / Tuya keys.</div>';
       return;
@@ -5991,6 +6078,11 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     const normC = rgbNormFromDev(dev);
     const orbCss = rgbCss(normC, 1);
     const cat = categoryLabel(dev);
+    const isVisDev = isVisualLayerDevice(dev);
+    const visMetric = getDeviceVisualMetricLabel(dev);
+    const tierBadge = isVisDev
+      ? `V•O${visMetric ? ` • ${visMetric}` : ''}`
+      : 'TIER O ONLY';
     const proto = dev.discoverySource === 'browser_lan'
       ? (dev.ssid ? `Wi-Fi LAN • ${dev.ssid}` : 'Wi-Fi LAN')
       : (dev.ip ? 'Local LAN' : (dev.platform === 'tuya' ? 'Tuya Cloud' : (dev._kind === 'cast' ? 'Google Cast' : 'BLE')));
@@ -6058,6 +6150,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
           <div class="vos-insp-name">${escapeHtml(dev.name)}</div>
           <div class="vos-insp-tags">
             <span class="vos-obj-cat">${escapeHtml(cat)}</span>
+            <span class="vos-obj-proto">${escapeHtml(tierBadge)}</span>
             <span class="vos-obj-proto">${escapeHtml(proto)}</span>
             ${dev.ip ? `<span class="vos-insp-ip">${escapeHtml(dev.ip)}</span>` : ''}
           </div>
@@ -6241,10 +6334,12 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     if (!state.activeVoiceAction) {
       state.focusedSysKey = '';
     }
-    const sO = sliceModels.o.find((x) => x.devId === devId) || sliceModels.v.find((x) => x.devId === devId);
-    if (sO && withZoom) {
+    const targetSlice = state.soloLayer === 'v'
+      ? (sliceModels.v.find((x) => x.devId === devId) || sliceModels.o.find((x) => x.devId === devId))
+      : (sliceModels.o.find((x) => x.devId === devId) || sliceModels.v.find((x) => x.devId === devId));
+    if (targetSlice && withZoom) {
       state.focusedDeviceIds = [devId];
-      spinToSlice(sO, 0, 'user');
+      spinToSlice(targetSlice, 0, 'user');
     }
     renderDeviceNav();
     renderSystemChips(true);
@@ -6272,7 +6367,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       viewport: el('vosViewport'),
       webglCanvas: el('vosWebglCanvas'),
       hudCanvas: el('vosHudCanvas'),
+      vStatsBadge: el('vosVisualStats'),
       oStatsBadge: el('vosObjectiveStats'),
+      sectorMatrixTitle: el('vosSectorMatrixTitle'),
       deviceNav: el('vosDeviceNav'),
       sChips: el('vosSystemChips'),
       sLogs: el('vosSystemLogs'),
@@ -6424,7 +6521,15 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       btn.addEventListener('click', () => {
         state.soloLayer = btn.dataset.solo || 'all';
         els.soloBtns.forEach((b) => b.classList.toggle('active', b === btn));
+        if (state.soloLayer === 'v' && state.openMenuSliceKey && state.openMenuSliceKey.startsWith('o:')) {
+          const devId = state.openMenuSliceKey.slice(2);
+          const vSl = findSliceByKey(`v:${devId}`);
+          if (vSl) openSliceMenu(vSl);
+          else closeSliceMenu();
+        }
         updateModeBadgeAndClasses();
+        renderDeviceNav();
+        renderInspector();
       });
     });
 
@@ -6630,7 +6735,31 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     resetSystemUsage,
     clearLocalCache,
     setCaptureAudioLevel,
-    pushLog
+    pushLog,
+    isVisualLayerDevice,
+    getDeviceVisualMetricLabel,
+    getLayerSlices: () => ({
+      soloLayer: state.soloLayer,
+      v: sliceModels.v.map((s) => ({
+        key: s.key,
+        devId: s.devId,
+        name: s.dev?.name || '',
+        category: s.dev?.category || '',
+        metric: getDeviceVisualMetricLabel(s.dev)
+      })),
+      o: sliceModels.o.map((s) => ({
+        key: s.key,
+        devId: s.devId,
+        name: s.dev?.name || '',
+        category: s.dev?.category || '',
+        isVisual: isVisualLayerDevice(s.dev)
+      })),
+      s: sliceModels.s.map((s) => ({
+        key: s.key,
+        sysKey: s.sysKey,
+        name: s.sys?.name || ''
+      }))
+    })
   };
 
   window.dispatchEvent(new CustomEvent('treva:vos-ready'));

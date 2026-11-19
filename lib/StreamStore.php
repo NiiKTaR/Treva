@@ -235,6 +235,7 @@ class StreamStore
                     $devices[$id] = array_merge($devices[$id] ?? [], $dev);
                 }
             }
+            $devices = self::deduplicateCastDevicesMap($devices);
             if ($isLocalEnv) {
                 $this->writeDiskCastDevices($devices);
             }
@@ -267,9 +268,6 @@ class StreamStore
         if (session_status() === PHP_SESSION_ACTIVE) {
             $_SESSION['treva_vault'] = $this->memoryVault;
             unset($_SESSION['treva_tuya_tokens']);
-            if (!headers_sent()) {
-                @session_regenerate_id(true);
-            }
         }
     }
 
@@ -402,18 +400,7 @@ class StreamStore
             if (!is_array($data) || empty($data)) {
                 return [];
             }
-            $out = [];
-            foreach ($data as $k => $dev) {
-                if (!is_array($dev)) continue;
-                $id = trim((string)($dev['id'] ?? $k));
-                if ($id === '') continue;
-                if (!empty($dev['host']) && empty($dev['isSdkOnly']) && class_exists('NetworkHelper') && !NetworkHelper::isHostOnCurrentLan((string)$dev['host'])) {
-                    continue;
-                }
-                $dev['id'] = $id;
-                $out[$id] = $dev;
-            }
-            return $out;
+            return self::filterCastDevicesMap($data, true);
         });
     }
 
@@ -427,6 +414,205 @@ class StreamStore
     private static function isPersistableNetworkId(string $networkId): bool
     {
         return $networkId !== '' && $networkId !== 'mobile_data' && $networkId !== 'local_no_lan';
+    }
+
+    private static function isGenericCastName(string $name): bool
+    {
+        $n = trim($name);
+        if ($n === '') return true;
+        return (bool)preg_match(
+            '/^(Chromecast(?:\s*\/\s*Google\s*TV)?|Google\s+Nest(?:\s+(?:Speaker|Mini|Audio|Hub))?|Google\s+Cast(?:\s+(?:Device|Speaker|Display|Receiver))?|Cast(?:\s+(?:Device|Receiver|Speaker|Display))?)(?:\s*\([0-9a-zA-Z._:-]+\)|\s+[0-9]{1,3}(?:\.[0-9]{1,3}){3})?$/i',
+            $n
+        );
+    }
+
+    private static function castIdScore(string $id): int
+    {
+        $id = trim($id);
+        if ($id === '') return 0;
+        if (str_starts_with($id, 'manual-') || str_contains($id, ':')) return 1;
+        if (str_starts_with($id, 'sdk-')) return 2;
+        if (str_starts_with($id, 'cast-lan-')) return 3;
+        return 4;
+    }
+
+    private static function isPlaceholderModel(string $model): bool
+    {
+        $m = trim($model);
+        if ($m === '') return true;
+        return str_contains($m, '(Wi-Fi LAN)') || str_contains($m, '(Wi-Fi SDK)') || str_contains($m, '(Manual)') || $m === 'Google Cast Device';
+    }
+
+    private static function mergeTwoCastDevices(array $a, array $b): array
+    {
+        $scoreA = self::castIdScore((string)($a['id'] ?? ''));
+        $scoreB = self::castIdScore((string)($b['id'] ?? ''));
+        $primary = ($scoreB > $scoreA) ? $b : $a;
+        $secondary = ($scoreB > $scoreA) ? $a : $b;
+
+        $id = (string)$primary['id'];
+        $pName = trim((string)($primary['name'] ?? ''));
+        $sName = trim((string)($secondary['name'] ?? ''));
+        $name = (!self::isGenericCastName($pName))
+            ? $pName
+            : ((!self::isGenericCastName($sName)) ? $sName : ($pName !== '' ? $pName : $sName));
+
+        $pHost = trim((string)($primary['host'] ?? ''));
+        $sHost = trim((string)($secondary['host'] ?? ''));
+        $host = $pHost !== '' ? $pHost : $sHost;
+
+        $pPort = (int)($primary['port'] ?? 0);
+        $sPort = (int)($secondary['port'] ?? 0);
+        $port = ($pPort > 0 && $pPort !== 8009)
+            ? $pPort
+            : (($sPort > 0 && $sPort !== 8009) ? $sPort : ($pPort > 0 ? $pPort : ($sPort > 0 ? $sPort : 8009)));
+
+        // Trust LAN-probed record (has host IP) over hostless SDK record for kind/capabilities
+        $lanRec = $pHost !== '' ? $primary : ($sHost !== '' ? $secondary : $primary);
+        $kind = (($lanRec['kind'] ?? '') === 'display') ? 'display' : ((($lanRec['kind'] ?? '') === 'speaker') ? 'speaker' : ((($primary['kind'] ?? '') === 'display') ? 'display' : 'speaker'));
+
+        $pModel = trim((string)($primary['model'] ?? ''));
+        $sModel = trim((string)($secondary['model'] ?? ''));
+        $model = (!self::isPlaceholderModel($pModel))
+            ? $pModel
+            : ((!self::isPlaceholderModel($sModel)) ? $sModel : ($pModel !== '' ? $pModel : $sModel));
+
+        $capabilities = (int)($lanRec['capabilities'] ?? ($primary['capabilities'] ?? ($kind === 'display' ? 5 : 4)));
+        $variant = trim((string)($lanRec['variant'] ?? ($primary['variant'] ?? '')));
+        if ($variant === '' && class_exists('CastMdns')) {
+            $variant = CastMdns::classifyVariant($model, $capabilities);
+        }
+
+        $pStatus = strtoupper(trim((string)($primary['status'] ?? 'IDLE')));
+        $sStatus = strtoupper(trim((string)($secondary['status'] ?? 'IDLE')));
+        $activeStates = ['PLAYING', 'BUFFERING', 'ACTIVE'];
+        $status = in_array($pStatus, $activeStates, true)
+            ? $pStatus
+            : (in_array($sStatus, $activeStates, true) ? $sStatus : ($pStatus !== '' ? $pStatus : 'IDLE'));
+
+        $merged = array_merge($secondary, $primary, [
+            'id' => $id,
+            'name' => $name !== '' ? $name : ($host !== '' ? "Google Cast ({$host})" : 'Google Cast Device'),
+            'model' => $model !== '' ? $model : ($kind === 'display' ? 'Chromecast' : 'Google Cast Speaker'),
+            'variant' => $variant !== '' ? $variant : ($kind === 'display' ? 'chromecast' : 'nest_speaker'),
+            'host' => $host,
+            'port' => $port,
+            'capabilities' => $capabilities,
+            'kind' => $kind,
+            'supportsVideo' => $kind === 'display',
+            'supportsAudio' => true,
+            'online' => !empty($primary['online']) || !empty($secondary['online']),
+            'isManual' => !empty($primary['isManual']) && !empty($secondary['isManual']),
+            'isSdkOnly' => $host === '',
+            'status' => $status,
+            'lastSeen' => max((int)($primary['lastSeen'] ?? 0), (int)($secondary['lastSeen'] ?? 0))
+        ]);
+
+        foreach (['mdxScreenId', 'mdxTheme', 'mdxAppId', 'ssid', 'bssid', 'sdkDeviceId', 'discoverySource'] as $field) {
+            $val = trim((string)($primary[$field] ?? '')) ?: trim((string)($secondary[$field] ?? ''));
+            if ($val !== '') {
+                $merged[$field] = $val;
+            }
+        }
+        return $merged;
+    }
+
+    public static function deduplicateCastDevicesMap(array $devicesById): array
+    {
+        $list = [];
+        foreach ($devicesById as $k => $dev) {
+            if (!is_array($dev)) continue;
+            $id = trim((string)($dev['id'] ?? $k));
+            if ($id === '') continue;
+            $dev['id'] = $id;
+            $list[] = $dev;
+        }
+        if (count($list) <= 1) {
+            $singleOut = [];
+            foreach ($list as $d) {
+                $singleOut[$d['id']] = self::enrichKnownCastDefaults($d);
+            }
+            return $singleOut;
+        }
+
+        // Pass 1: Merge records sharing the exact same non-empty host:port endpoint
+        $byEndpoint = [];
+        $noEndpoint = [];
+        foreach ($list as $d) {
+            $host = strtolower(trim((string)($d['host'] ?? '')));
+            $port = (int)($d['port'] ?? 8009);
+            $port = $port > 0 ? $port : 8009;
+            if ($host !== '') {
+                $epKey = $host . ':' . $port;
+                $byEndpoint[$epKey] = isset($byEndpoint[$epKey])
+                    ? self::mergeTwoCastDevices($byEndpoint[$epKey], $d)
+                    : $d;
+            } else {
+                $noEndpoint[] = $d;
+            }
+        }
+        $stage1 = array_merge(array_values($byEndpoint), $noEndpoint);
+
+        // Pass 2: Merge records sharing the exact same real friendly name (case-insensitive)
+        $byRealName = [];
+        $genericNamed = [];
+        foreach ($stage1 as $d) {
+            $name = trim((string)($d['name'] ?? ''));
+            if (!self::isGenericCastName($name)) {
+                $nKey = strtolower($name);
+                $byRealName[$nKey] = isset($byRealName[$nKey])
+                    ? self::mergeTwoCastDevices($byRealName[$nKey], $d)
+                    : $d;
+            } else {
+                $genericNamed[] = $d;
+            }
+        }
+
+        // Pass 3: Pair remaining hostless Cast Menu (SDK) devices (which have a real friendly name but no IP)
+        // with unnamed Browser-LAN devices (cast-lan-* which have a LAN IP but a placeholder name like "Chromecast (192.168.100.8)")
+        foreach ($byRealName as $nKey => $namedDev) {
+            if (!empty($namedDev['host']) || empty($genericNamed)) {
+                continue;
+            }
+            $namedKind = ($namedDev['kind'] ?? '') === 'display' ? 'display' : 'speaker';
+            $matchIdx = null;
+            foreach ($genericNamed as $gIdx => $gDev) {
+                if (!empty($gDev['host']) && (($gDev['kind'] ?? '') === $namedKind)) {
+                    $matchIdx = $gIdx;
+                    break;
+                }
+            }
+            // If only 1 unnamed LAN device remains and kind differed only due to SDK capability fallback, pair them
+            if ($matchIdx === null && count($genericNamed) === 1 && !empty($genericNamed[0]['host'])) {
+                $matchIdx = 0;
+            }
+            if ($matchIdx !== null) {
+                $byRealName[$nKey] = self::mergeTwoCastDevices($genericNamed[$matchIdx], $namedDev);
+                array_splice($genericNamed, $matchIdx, 1);
+            }
+        }
+
+        $finalOut = [];
+        foreach (array_merge(array_values($byRealName), $genericNamed) as $d) {
+            $d = self::enrichKnownCastDefaults($d);
+            $id = (string)$d['id'];
+            $finalOut[$id] = isset($finalOut[$id])
+                ? self::mergeTwoCastDevices($finalOut[$id], $d)
+                : $d;
+        }
+        return $finalOut;
+    }
+
+    private static function enrichKnownCastDefaults(array $merged): array
+    {
+        $kind = (($merged['kind'] ?? '') === 'display') ? 'display' : 'speaker';
+        if (empty($merged['mdxAppId'])) {
+            $merged['mdxAppId'] = $kind === 'display' ? '233637DE' : '2DB7CC49';
+        }
+        if (empty($merged['mdxTheme'])) {
+            $merged['mdxTheme'] = $kind === 'display' ? 'cl' : 'm';
+        }
+        return $merged;
     }
 
     private static function filterCastDevicesMap(array $rawDevices, bool $checkLocalLan): array
@@ -449,7 +635,7 @@ class StreamStore
             $dev['id'] = $id;
             $out[$id] = $dev;
         }
-        return $out;
+        return self::deduplicateCastDevicesMap($out);
     }
 
     private function readNetworkCastDevices(string $networkId): array
@@ -515,6 +701,7 @@ class StreamStore
 
     private function commitDevicesState(array $v, array $devicesById, ?string $networkId = null, bool $markHydrated = true): array
     {
+        $devicesById = self::deduplicateCastDevicesMap($devicesById);
         $resolvedNetId = $networkId !== null
             ? $networkId
             : (class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '');
@@ -598,6 +785,13 @@ class StreamStore
             if (count($filtered) !== count($devs)) {
                 return $this->commitDevicesState($v, $filtered, $currentNetId !== '' ? $currentNetId : null, false);
             }
+            $devs = $filtered;
+        } elseif (!empty($devs)) {
+            $deduped = self::deduplicateCastDevicesMap($devs);
+            if (count($deduped) !== count($devs)) {
+                return $this->commitDevicesState($v, $deduped, $currentNetId !== '' ? $currentNetId : null, false);
+            }
+            $devs = $deduped;
         }
 
         if ($restored || ($currentNetId !== '' && empty($v['networkId']))) {
@@ -755,36 +949,48 @@ class StreamStore
         $v = $this->readVault();
         $devices = $this->currentDevicesForMutation($v);
 
-        // Reuse matching existing device by exact case-insensitive name if present on this Wi-Fi
+        // Reuse matching existing device by exact case-insensitive name or sdkDeviceId if present on this Wi-Fi
         $targetId = $sdkId;
         foreach ($devices as $exId => $exDev) {
             if (strcasecmp(trim((string)($exDev['name'] ?? '')), $name) === 0) {
                 $targetId = (string)$exId;
                 break;
             }
+            if ($rawSdkId !== '' && !empty($exDev['sdkDeviceId']) && strcasecmp(trim((string)$exDev['sdkDeviceId']), $rawSdkId) === 0) {
+                $targetId = (string)$exId;
+                break;
+            }
         }
-        // If no name match yet, upgrade a single unnamed browser_lan placeholder (cast-lan-*) of the same kind so its IP and real name unify automatically
+        // If no name match yet, upgrade an unnamed browser_lan placeholder (cast-lan-*) of the same kind (or the sole remaining placeholder) so its IP and real name unify automatically
         if ($targetId === $sdkId) {
-            $placeholders = [];
+            $sameKindPlaceholders = [];
+            $allPlaceholders = [];
             foreach ($devices as $exId => $exDev) {
-                if (
-                    str_starts_with((string)$exId, 'cast-lan-') &&
-                    ($exDev['kind'] ?? '') === $kind &&
-                    preg_match('/^(Chromecast|Google Nest|Cast Device)\s*\(\d{1,3}\./i', (string)($exDev['name'] ?? ''))
-                ) {
-                    $placeholders[] = (string)$exId;
+                if (!empty($exDev['host']) && self::isGenericCastName((string)($exDev['name'] ?? ''))) {
+                    $allPlaceholders[] = (string)$exId;
+                    if (($exDev['kind'] ?? '') === $kind) {
+                        $sameKindPlaceholders[] = (string)$exId;
+                    }
                 }
             }
-            if (count($placeholders) === 1) {
-                $targetId = $placeholders[0];
+            if (count($sameKindPlaceholders) === 1) {
+                $targetId = $sameKindPlaceholders[0];
+            } elseif (empty($sameKindPlaceholders) && count($allPlaceholders) === 1) {
+                $targetId = $allPlaceholders[0];
             }
         }
 
         $prev = $devices[$targetId] ?? [];
         $isDiskless = empty($prev['host']);
+        // Preserve LAN-probed kind if matching an existing LAN device so SDK capability gaps never flip a speaker to display
+        if (!$isDiskless && !empty($prev['kind']) && in_array($prev['kind'], ['speaker', 'display'], true)) {
+            $kind = $prev['kind'];
+        }
         $model = trim((string)($info['model'] ?? ($info['modelName'] ?? '')));
         if ($model === '') {
-            $model = $prev['model'] ?? ($kind === 'display' ? 'Chromecast / Google TV (Wi-Fi SDK)' : 'Google Nest Speaker (Wi-Fi SDK)');
+            $model = (!empty($prev['model']) && !self::isPlaceholderModel((string)$prev['model']))
+                ? $prev['model']
+                : ($prev['model'] ?? ($kind === 'display' ? 'Chromecast / Google TV (Wi-Fi SDK)' : 'Google Nest Speaker (Wi-Fi SDK)'));
         }
         $isGroup = str_contains(strtolower($model), 'group');
         $defaultTheme = $kind === 'display' ? 'cl' : 'm';
@@ -803,7 +1009,7 @@ class StreamStore
             'online' => true,
             'isManual' => !empty($prev['isManual']),
             'isSdkOnly' => $isDiskless,
-            'sdkDeviceId' => $rawSdkId,
+            'sdkDeviceId' => $rawSdkId !== '' ? $rawSdkId : ($prev['sdkDeviceId'] ?? ''),
             'status' => strtoupper(trim((string)($info['status'] ?? ($prev['status'] ?? 'ACTIVE')))),
             'volume' => isset($info['volume']) && is_numeric($info['volume'])
                 ? max(0.0, min(1.0, (float)$info['volume']))
@@ -818,8 +1024,8 @@ class StreamStore
         }
 
         $devices[$targetId] = $entry;
-        $this->commitDevicesState($v, $devices, null, true);
-        return $entry;
+        $committed = $this->commitDevicesState($v, $devices, null, true);
+        return $committed[$targetId] ?? (reset($committed) ?: $entry);
     }
 
     public function addManualDevice(string $name, string $host, int $port = 8009, string $kind = 'speaker'): array

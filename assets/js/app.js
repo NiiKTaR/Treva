@@ -100,16 +100,156 @@
     }
   }
 
-  function normalizeDevicesList(raw) {
-    if (Array.isArray(raw)) {
-      return raw.filter((d) => d && typeof d === 'object');
+  function isGenericCastDeviceName(name) {
+    const n = String(name || '').trim();
+    if (!n) return true;
+    return /^(Chromecast(?:\s*\/\s*Google\s*TV)?|Google\s+Nest(?:\s+(?:Speaker|Mini|Audio|Hub))?|Google\s+Cast(?:\s+(?:Device|Speaker|Display|Receiver))?|Cast(?:\s+(?:Device|Receiver|Speaker|Display))?)(?:\s*\([0-9a-zA-Z._:-]+\)|\s+\d{1,3}(?:\.\d{1,3}){3})?$/i.test(n);
+  }
+
+  function scoreCastDeviceId(id) {
+    const s = String(id || '').trim();
+    if (!s) return 0;
+    if (s.startsWith('manual-') || s.includes(':')) return 1;
+    if (s.startsWith('sdk-')) return 2;
+    if (s.startsWith('cast-lan-')) return 3;
+    return 4;
+  }
+
+  function isPlaceholderCastModel(model) {
+    const m = String(model || '').trim();
+    if (!m) return true;
+    return m.includes('(Wi-Fi LAN)') || m.includes('(Wi-Fi SDK)') || m.includes('(Manual)') || m === 'Google Cast Device';
+  }
+
+  function mergeTwoCastDeviceObjects(a, b) {
+    const scoreA = scoreCastDeviceId(a && a.id);
+    const scoreB = scoreCastDeviceId(b && b.id);
+    const primary = scoreB > scoreA ? b : a;
+    const secondary = scoreB > scoreA ? a : b;
+
+    const id = String(primary.id || secondary.id || '');
+    const pName = String(primary.name || '').trim();
+    const sName = String(secondary.name || '').trim();
+    const name = !isGenericCastDeviceName(pName)
+      ? pName
+      : (!isGenericCastDeviceName(sName) ? sName : (pName || sName));
+
+    const pHost = String(primary.host || '').trim();
+    const sHost = String(secondary.host || '').trim();
+    const host = pHost || sHost;
+
+    const pPort = Number(primary.port || 0);
+    const sPort = Number(secondary.port || 0);
+    const port = (pPort > 0 && pPort !== 8009)
+      ? pPort
+      : ((sPort > 0 && sPort !== 8009) ? sPort : (pPort > 0 ? pPort : (sPort > 0 ? sPort : 8009)));
+
+    const lanRec = pHost ? primary : (sHost ? secondary : primary);
+    const kind = lanRec.kind === 'display'
+      ? 'display'
+      : (lanRec.kind === 'speaker' ? 'speaker' : (primary.kind === 'display' ? 'display' : 'speaker'));
+
+    const pModel = String(primary.model || '').trim();
+    const sModel = String(secondary.model || '').trim();
+    const model = !isPlaceholderCastModel(pModel)
+      ? pModel
+      : (!isPlaceholderCastModel(sModel) ? sModel : (pModel || sModel));
+
+    const activeStates = new Set(['PLAYING', 'BUFFERING', 'ACTIVE']);
+    const pStatus = String(primary.status || 'IDLE').toUpperCase();
+    const sStatus = String(secondary.status || 'IDLE').toUpperCase();
+    const status = activeStates.has(pStatus)
+      ? pStatus
+      : (activeStates.has(sStatus) ? sStatus : (pStatus || 'IDLE'));
+
+    const merged = {
+      ...secondary,
+      ...primary,
+      id,
+      name: name || (host ? `Google Cast (${host})` : 'Google Cast Device'),
+      model: model || (kind === 'display' ? 'Chromecast' : 'Google Cast Speaker'),
+      host,
+      port,
+      kind,
+      supportsVideo: kind === 'display',
+      supportsAudio: true,
+      online: Boolean(primary.online || secondary.online),
+      isManual: Boolean(primary.isManual && secondary.isManual),
+      isSdkOnly: !host,
+      status
+    };
+
+    ['mdxScreenId', 'mdxTheme', 'mdxAppId', 'ssid', 'bssid', 'sdkDeviceId', 'discoverySource', 'variant'].forEach((k) => {
+      const val = String(primary[k] || secondary[k] || '').trim();
+      if (val) merged[k] = val;
+    });
+    return merged;
+  }
+
+  function deduplicateCastDevicesList(rawList) {
+    const list = (rawList || []).filter((d) => d && typeof d === 'object' && d.id);
+    if (list.length <= 1) return list;
+
+    // Pass 1: Merge devices sharing the exact same non-empty host:port endpoint
+    const byEndpoint = new Map();
+    const noEndpoint = [];
+    list.forEach((d) => {
+      const host = String(d.host || '').trim().toLowerCase();
+      const port = Number(d.port || 8009) || 8009;
+      if (host) {
+        const key = `${host}:${port}`;
+        byEndpoint.set(key, byEndpoint.has(key) ? mergeTwoCastDeviceObjects(byEndpoint.get(key), d) : d);
+      } else {
+        noEndpoint.push(d);
+      }
+    });
+    const stage1 = [...byEndpoint.values(), ...noEndpoint];
+
+    // Pass 2: Merge devices sharing the exact same real friendly name (case-insensitive)
+    const byRealName = new Map();
+    const genericNamed = [];
+    stage1.forEach((d) => {
+      const nm = String(d.name || '').trim();
+      if (!isGenericCastDeviceName(nm)) {
+        const key = nm.toLowerCase();
+        byRealName.set(key, byRealName.has(key) ? mergeTwoCastDeviceObjects(byRealName.get(key), d) : d);
+      } else {
+        genericNamed.push(d);
+      }
+    });
+
+    // Pass 3: Pair hostless Cast Menu (SDK) devices with unnamed Browser-LAN devices (cast-lan-*)
+    for (const [key, namedDev] of byRealName.entries()) {
+      if (namedDev.host || genericNamed.length === 0) continue;
+      const namedKind = namedDev.kind === 'display' ? 'display' : 'speaker';
+      let matchIdx = genericNamed.findIndex((g) => g.host && (g.kind === namedKind));
+      if (matchIdx === -1 && genericNamed.length === 1 && genericNamed[0].host) {
+        matchIdx = 0;
+      }
+      if (matchIdx !== -1) {
+        const gDev = genericNamed.splice(matchIdx, 1)[0];
+        byRealName.set(key, mergeTwoCastDeviceObjects(gDev, namedDev));
+      }
     }
-    if (raw && typeof raw === 'object') {
-      return Object.entries(raw)
+
+    const byFinalId = new Map();
+    [...byRealName.values(), ...genericNamed].forEach((d) => {
+      const id = String(d.id);
+      byFinalId.set(id, byFinalId.has(id) ? mergeTwoCastDeviceObjects(byFinalId.get(id), d) : d);
+    });
+    return Array.from(byFinalId.values());
+  }
+
+  function normalizeDevicesList(raw) {
+    let arr = [];
+    if (Array.isArray(raw)) {
+      arr = raw.filter((d) => d && typeof d === 'object');
+    } else if (raw && typeof raw === 'object') {
+      arr = Object.entries(raw)
         .filter(([, d]) => d && typeof d === 'object')
         .map(([k, d]) => (d.id ? d : { id: k, ...d }));
     }
-    return [];
+    return deduplicateCastDevicesList(arr);
   }
 
   function hasMeaningfulVault(v) {
@@ -171,6 +311,8 @@
       if (window.localStorage) {
         window.localStorage.removeItem(LOCAL_VAULT_KEY);
         window.localStorage.removeItem('treva_vos_slice_scenes_v1');
+        window.localStorage.removeItem(DIAG_SUBNET_STORAGE_KEY);
+        window.localStorage.removeItem(DIAG_SUBNET_BY_NET_KEY);
       }
       if (window.sessionStorage) {
         window.sessionStorage.removeItem(TAB_VAULT_KEY);
@@ -276,6 +418,8 @@
 
   async function clearLocalSession() {
     try {
+      browserCastScanPromise = null;
+      lastSdkRegisteredKey = '';
       const res = await fetch(apiUrl('session_clear'), {
         method: 'POST',
         cache: 'no-store'
@@ -306,7 +450,14 @@
       }
       syncVosState();
       updateLocalSessionStatusUi();
-      showToast('Cleared local session keys, IDs, and devices from this browser.', 'info');
+      showToast('Cleared saved keys & cache — rescanning active LAN devices...', 'info');
+      // Immediately rediscover active LAN Cast & Wi-Fi devices so LAN search works 100% after clearing Keys cache
+      if (!detectMobileDataConnection()) {
+        await autoConnectCastDevicesForPie(false);
+        if ((serverInfo && serverInfo.isLocalEnvironment) || localLanBridgeBase) {
+          discoverSmartWifi(true);
+        }
+      }
     } catch (err) {
       showToast(err.message || 'Failed to clear local session', 'error');
     }
@@ -551,6 +702,7 @@
   let lastLanDiagReport = null;
   let lanDiagRunning = false;
   let browserCastScanPromise = null;
+  let castDiscoveryInFlightCount = 0;
   let lnaPermissionWatcherAttached = false;
   let castScanState = {
     active: false,
@@ -889,46 +1041,56 @@
     return { supported: false, state: 'unsupported', useLna: false, permStatus: null };
   }
 
-  async function verifyAndClassifyBrowserCastHost(ip, useLna = false, ms = 0) {
+  async function verifyAndClassifyBrowserCastHost(ip, useLna = false, ms = 0, eurekaCorsConfirmed = false) {
     // 1. Confirm Google Cast receiver via /setup/icon.png (301 redirect to gstatic eureka_device.png with CORS header)
-    let confirmedCast = false;
-    try {
-      const c1 = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const t1 = c1 ? setTimeout(() => c1.abort(), 700) : null;
-      const o1 = { mode: 'cors', redirect: 'manual', cache: 'no-store', signal: c1 ? c1.signal : undefined };
-      if (useLna) o1.targetAddressSpace = 'local';
-      const iconRes = await fetch(`http://${ip}:8008/setup/icon.png`, o1);
-      if (t1) clearTimeout(t1);
-      if (iconRes && (iconRes.type === 'opaqueredirect' || iconRes.status === 301 || iconRes.status === 302 || iconRes.ok)) {
-        confirmedCast = true;
-      }
-    } catch (_) {}
+    let confirmedCast = Boolean(eurekaCorsConfirmed);
+    if (!confirmedCast) {
+      try {
+        const c1 = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const t1 = c1 ? setTimeout(() => c1.abort(), 900) : null;
+        const o1 = { mode: 'cors', redirect: 'manual', cache: 'no-store', signal: c1 ? c1.signal : undefined };
+        if (useLna) o1.targetAddressSpace = 'local';
+        const iconRes = await fetch(`http://${ip}:8008/setup/icon.png`, o1);
+        if (t1) clearTimeout(t1);
+        if (iconRes && (iconRes.type === 'opaqueredirect' || iconRes.status === 301 || iconRes.status === 302 || iconRes.ok)) {
+          confirmedCast = true;
+        }
+      } catch (_) {}
+    }
     if (!confirmedCast) return null;
 
-    // 2. Distinguish Chromecast / Google TV displays (DIAL /apps/ChromeCast reflects CORS 200/404) from Nest Audio speakers (rejects CORS on /apps/*)
+    // 2. Distinguish Chromecast / Google TV displays (DIAL /apps/ChromeCast reflects CORS 200/403/404) from Nest Audio speakers (rejects CORS on /apps/*)
     let isDisplay = false;
-    try {
-      const c2 = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const t2 = c2 ? setTimeout(() => c2.abort(), 700) : null;
-      const o2 = { mode: 'cors', cache: 'no-store', signal: c2 ? c2.signal : undefined };
-      if (useLna) o2.targetAddressSpace = 'local';
-      const dialRes = await fetch(`http://${ip}:8008/apps/ChromeCast`, o2);
-      if (t2) clearTimeout(t2);
-      if (dialRes && (dialRes.type === 'cors' || dialRes.ok || dialRes.status === 200 || dialRes.status === 403 || dialRes.status === 404)) {
-        isDisplay = true;
+    for (let attempt = 0; attempt < 2 && !isDisplay; attempt++) {
+      let timedOut = false;
+      try {
+        const c2 = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const t2 = c2 ? setTimeout(() => { timedOut = true; c2.abort(); }, 950) : null;
+        const o2 = { mode: 'cors', cache: 'no-store', signal: c2 ? c2.signal : undefined };
+        if (useLna) o2.targetAddressSpace = 'local';
+        const dialRes = await fetch(`http://${ip}:8008/apps/ChromeCast`, o2);
+        if (t2) clearTimeout(t2);
+        if (dialRes && (dialRes.type === 'cors' || dialRes.ok || dialRes.status === 200 || dialRes.status === 403 || dialRes.status === 404)) {
+          isDisplay = true;
+        }
+        break;
+      } catch (_) {
+        if (!timedOut) break;
       }
-    } catch (_) {}
+    }
 
     // 3. Preserve real friendly name/UDN if already known on this Wi-Fi (from cast_networks.json, local vault, or SDK)
     const knownMatch = (devices || []).find((d) => d && d.host === ip && Number(d.port || 8009) === 8009);
     const kind = (knownMatch && knownMatch.kind) || (isDisplay ? 'display' : 'speaker');
-    const model = (knownMatch && knownMatch.model) || (kind === 'display' ? 'Chromecast / Google TV (Wi-Fi LAN)' : 'Google Nest Speaker (Wi-Fi LAN)');
+    const model = (knownMatch && !isPlaceholderCastModel(knownMatch.model) && knownMatch.model)
+      || (kind === 'display' ? 'Chromecast / Google TV (Wi-Fi LAN)' : 'Google Nest Speaker (Wi-Fi LAN)');
     const capabilities = (knownMatch && knownMatch.capabilities) || (kind === 'display' ? 5 : 4);
     const variant = (knownMatch && knownMatch.variant) || classifyCastVariantJs(model, capabilities);
     const id = (knownMatch && knownMatch.id && !String(knownMatch.id).startsWith('manual-'))
       ? String(knownMatch.id)
       : `cast-lan-${ip.replace(/\./g, '-')}`;
-    const name = (knownMatch && knownMatch.name) || (kind === 'display' ? `Chromecast (${ip})` : `Google Nest (${ip})`);
+    const name = (knownMatch && !isGenericCastDeviceName(knownMatch.name) && knownMatch.name)
+      || (kind === 'display' ? `Chromecast (${ip})` : `Google Nest (${ip})`);
 
     return {
       id,
@@ -988,7 +1150,7 @@
       // Modern Google Cast firmware returns HTTP 404 WITH Access-Control-Allow-Origin reflected to browser User-Agents.
       // Because mode:'cors' only resolves when the host explicitly allows this origin, verify via /setup/icon.png & /apps/ChromeCast!
       if (res.status === 404 && res.type === 'cors') {
-        return await verifyAndClassifyBrowserCastHost(ip, useLna, elapsedMs);
+        return await verifyAndClassifyBrowserCastHost(ip, useLna, elapsedMs, true);
       }
       return null;
     } catch (_) {
@@ -1003,30 +1165,15 @@
 
   function mergeBrowserCastDevicesLocally(foundList) {
     if (!Array.isArray(foundList) || foundList.length === 0) return devices;
-    const byId = new Map();
-    (devices || []).forEach((d) => {
-      if (d && d.id) byId.set(String(d.id), d);
-    });
-    foundList.forEach((f) => {
-      if (!f || !f.id) return;
-      const prev = byId.get(String(f.id)) || {};
-      // Drop synthetic manual-<ip>-8009 duplicate if same IP is now matched by real Cast UDN
-      for (const [exId, exDev] of Array.from(byId.entries())) {
-        if (exId !== String(f.id) && exId.startsWith('manual-') && exDev && exDev.host === f.host && Number(exDev.port || 8009) === Number(f.port || 8009)) {
-          byId.delete(exId);
-        }
-      }
-      byId.set(String(f.id), {
-        volume: 0.7,
-        muted: false,
-        status: 'IDLE',
-        ...prev,
-        ...f,
-        online: true,
-        isSdkOnly: false
-      });
-    });
-    devices = Array.from(byId.values());
+    const incoming = foundList.map((f) => ({
+      volume: 0.7,
+      muted: false,
+      status: 'IDLE',
+      ...f,
+      online: true,
+      isSdkOnly: false
+    }));
+    devices = deduplicateCastDevicesList([...(devices || []), ...incoming]);
     renderDevices(true);
     syncVosState();
     return devices;
@@ -1234,10 +1381,26 @@
         await scanIpList(knownIps, 16, 520);
       }
 
-      // Wave 1: Fast priority DHCP octets (.2-.35) on detected/remembered subnet
+      // Wave 1: Fast priority DHCP octets (.2-.35) on detected/remembered subnet in 2 sub-batches so browser sockets never saturate
       const priorityOctets = [];
       for (let o = 2; o <= 35; o++) priorityOctets.push(o);
-      await scanIpList(priorityOctets.map((o) => `${activeSubnet}.${o}`), 34, 600);
+      await scanIpList(priorityOctets.map((o) => `${activeSubnet}.${o}`), 17, 800);
+
+      // Retry core DHCP range (.2-.20) once if < 2 devices answered (wakes sleeping Wi-Fi DTIM radios reliably after cache clear)
+      if (discoveredMap.size < 2 && !isMobileDataMode && !detectMobileDataConnection()) {
+        const foundHosts = new Set(Array.from(discoveredMap.values()).map((d) => d.host));
+        const retryCoreIps = [];
+        for (let o = 2; o <= 20; o++) {
+          const ip = `${activeSubnet}.${o}`;
+          if (!foundHosts.has(ip)) {
+            probedIps.delete(ip);
+            retryCoreIps.push(ip);
+          }
+        }
+        if (retryCoreIps.length > 0) {
+          await scanIpList(retryCoreIps, 19, 850);
+        }
+      }
 
       // Multi-subnet auto-fallback if primary subnet was a guess and yielded 0 Cast devices
       if (discoveredMap.size === 0 && !subnetInfo.confident && !opts.customSubnet) {
@@ -1845,6 +2008,7 @@
       await flushCastDevicesForNetworkChange('mobile_data', !silent ? 'Mobile Data active — Cast devices require Wi-Fi.' : '');
       return;
     }
+    castDiscoveryInFlightCount++;
     try {
       if (!silent) showToast('Searching for active Cast devices on current Wi-Fi...');
       const res = await fetch(apiUrl('discover'), { cache: 'no-store' });
@@ -1866,6 +2030,8 @@
       await runLocalNetworkDiagnostics({ silent, showPanel: !silent || (!devices || devices.length === 0) });
     } catch (err) {
       await runLocalNetworkDiagnostics({ silent, showPanel: true });
+    } finally {
+      castDiscoveryInFlightCount = Math.max(0, castDiscoveryInFlightCount - 1);
     }
   }
 
@@ -1875,6 +2041,7 @@
       await flushCastDevicesForNetworkChange('mobile_data');
       return;
     }
+    castDiscoveryInFlightCount++;
     try {
       const prevCachedVault = readLocalVault() || {};
       const res = await fetch(apiUrl('cast_auto_connect'), {
@@ -1927,23 +2094,26 @@
           showToast(`Connected ${devices.length} Cast device(s) to Pie display.`, 'success');
         }
       }
-    } catch (_) {}
 
-    // On remote hosting (e.g. www.knowhereco.ar/Treva without localhost), directly scan local Wi-Fi via browser Local Network Access.
-    const isRemoteWeb = !localLanBridgeBase && (!serverInfo || !serverInfo.isLocalEnvironment);
-    if (isRemoteWeb && !isMobileDataMode && !detectMobileDataConnection()) {
-      await discoverBrowserLanCastDevices({
-        silent: !wakeIdle,
-        interactive: Boolean(wakeIdle),
-        fullSweep: true
-      });
-    }
+      // On remote hosting (e.g. www.knowhereco.ar/Treva without localhost), directly scan local Wi-Fi via browser Local Network Access.
+      const isRemoteWeb = !localLanBridgeBase && (!serverInfo || !serverInfo.isLocalEnvironment);
+      if (isRemoteWeb && !isMobileDataMode && !detectMobileDataConnection()) {
+        await discoverBrowserLanCastDevices({
+          silent: !wakeIdle,
+          interactive: Boolean(wakeIdle),
+          fullSweep: true
+        });
+      }
 
-    if (castFrameworkReady && window.cast && window.cast.framework) {
-      try {
-        const sess = cast.framework.CastContext.getInstance().getCurrentSession();
-        if (sess) updateSdkUi(sess);
-      } catch (_) {}
+      if (castFrameworkReady && window.cast && window.cast.framework) {
+        try {
+          const sess = cast.framework.CastContext.getInstance().getCurrentSession();
+          if (sess) updateSdkUi(sess);
+        } catch (_) {}
+      }
+    } catch (_) {
+    } finally {
+      castDiscoveryInFlightCount = Math.max(0, castDiscoveryInFlightCount - 1);
     }
   }
 
@@ -1953,13 +2123,13 @@
     if (!startStatePolling.mediaTimer) {
       startStatePolling.mediaTimer = setInterval(async () => {
         if (isMobileDataMode || document.hidden || !serverInfo || !serverInfo.isLocalEnvironment) return;
-        if (Date.now() < interactionLockUntil) return;
+        if (castDiscoveryInFlightCount > 0 || browserCastScanPromise || Date.now() < interactionLockUntil) return;
         try {
           const res = await fetch(apiUrl('cast_sync_all', '&fast=1'), { cache: 'no-store' });
           if (!res.ok) return;
           const data = await res.json();
-          if (Array.isArray(data.devices) && Date.now() >= interactionLockUntil) {
-            devices = data.devices;
+          if (Array.isArray(data.devices) && castDiscoveryInFlightCount === 0 && Date.now() >= interactionLockUntil) {
+            devices = normalizeDevicesList(data.devices);
             renderDevices(false);
             syncVosState();
           }
@@ -2000,6 +2170,10 @@
           currentNetworkId = srvNet;
         }
 
+        if (castDiscoveryInFlightCount > 0 || browserCastScanPromise) {
+          return;
+        }
+
         if (data.sessionHydrated === false) {
           const localVault = readLocalVault();
           if (hasMeaningfulVault(localVault)) {
@@ -2011,7 +2185,7 @@
               }
               applySyncedScenesData(restored);
               if (Array.isArray(restored.devices)) {
-                devices = restored.devices;
+                devices = normalizeDevicesList(restored.devices);
                 renderDevices(true);
               }
               return;
@@ -2023,7 +2197,7 @@
 
         let changed = false;
         if (serverInfo && serverInfo.isLocalEnvironment && !serverInfo.isLocalBridge && Array.isArray(data.devices)) {
-          devices = data.devices;
+          devices = normalizeDevicesList(data.devices);
           renderDevices(false);
           changed = true;
         }
@@ -3705,6 +3879,35 @@
   // ===========================================================================
   let lastSdkRegisteredKey = '';
 
+  function inferCastSdkDeviceKind(castDev, fallbackName = '', defaultKind = 'display') {
+    const nm = String((castDev && castDev.friendlyName) || fallbackName || '').trim();
+    if (nm) {
+      const existing = (devices || []).find((d) => d && String(d.name || '').trim().toLowerCase() === nm.toLowerCase());
+      if (existing && (existing.kind === 'speaker' || existing.kind === 'display')) {
+        return existing.kind;
+      }
+    }
+    const modelAndName = `${(castDev && castDev.modelName) || ''} ${nm}`.toLowerCase();
+    if (
+      modelAndName.includes('mini') ||
+      modelAndName.includes('nest audio') ||
+      modelAndName.includes('google home') ||
+      modelAndName.includes('chromecast audio') ||
+      modelAndName.includes('speaker') ||
+      modelAndName.includes('group') ||
+      modelAndName.includes('rabbit') ||
+      modelAndName.includes('knowhere')
+    ) {
+      return 'speaker';
+    }
+    if (castDev && Array.isArray(castDev.capabilities) && castDev.capabilities.length > 0) {
+      const capVideo = (window.chrome && chrome.cast && chrome.cast.Capability && chrome.cast.Capability.VIDEO_OUT) || 'video_out';
+      const hasVid = castDev.capabilities.includes(capVideo) || castDev.capabilities.includes('video_out');
+      return hasVid ? 'display' : 'speaker';
+    }
+    return defaultKind;
+  }
+
   async function registerCastSdkDeviceToStore(info = {}) {
     const cleanName = String(info.name || info.friendlyName || '').trim();
     if (!cleanName || cleanName === 'Google Cast Device') return null;
@@ -3722,7 +3925,7 @@
       });
       const data = await res.json();
       if (res.ok && data && Array.isArray(data.devices)) {
-        devices = data.devices;
+        devices = normalizeDevicesList(data.devices);
         renderDevices(true);
         persistSessionVaultFromResponse(data);
         syncVosState();
@@ -3748,14 +3951,12 @@
       updateSdkUi(session);
       const castDev = session.getCastDevice ? session.getCastDevice() : null;
       const friendlyName = (castDev && castDev.friendlyName) || 'Google Cast Device';
-      const hasVideoOut = castDev && Array.isArray(castDev.capabilities)
-        ? castDev.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)
-        : true;
+      const inferredKind = inferCastSdkDeviceKind(castDev, friendlyName, 'display');
       const reg = await registerCastSdkDeviceToStore({
         deviceId: (castDev && castDev.deviceId) || '',
         name: friendlyName,
         model: (castDev && castDev.modelName) || '',
-        kind: hasVideoOut ? 'display' : 'speaker',
+        kind: inferredKind,
         status: 'ACTIVE'
       });
       showToast(`Paired active device: ${friendlyName}`, 'success');
@@ -3784,14 +3985,12 @@
     sdkSessionBox.classList.remove('hidden');
 
     if (castDev && castDev.friendlyName) {
-      const hasVideoOut = Array.isArray(castDev.capabilities)
-        ? castDev.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)
-        : true;
+      const inferredKind = inferCastSdkDeviceKind(castDev, castDev.friendlyName, 'display');
       registerCastSdkDeviceToStore({
         deviceId: castDev.deviceId || '',
         name: castDev.friendlyName,
         model: castDev.modelName || '',
-        kind: hasVideoOut ? 'display' : 'speaker',
+        kind: inferredKind,
         status: 'ACTIVE'
       });
     }
@@ -5788,9 +5987,7 @@
 
     const rcv = rawSess && rawSess.receiver ? rawSess.receiver : null;
     const rcvName = (rcv && rcv.friendlyName) ? String(rcv.friendlyName).trim() : String(act.target || '').trim();
-    const rcvHasVideo = rcv && Array.isArray(rcv.capabilities)
-      ? (rcv.capabilities.includes('video_out') || (window.chrome && chrome.cast && chrome.cast.Capability && rcv.capabilities.includes(chrome.cast.Capability.VIDEO_OUT)))
-      : (targetAppId === '233637DE');
+    const rcvHasVideo = inferCastSdkDeviceKind(rcv, rcvName, targetAppId === '233637DE' ? 'display' : 'speaker') === 'display';
 
     if (act.action === 'launch_app' && videoIds.length === 0) {
       if (rcvName) {
@@ -6525,6 +6722,9 @@
             }
             window.TrevaVos.pushLog('USER', userTxt, 'info');
           }
+          if (typeof checkVoiceMatchTranscript === 'function' && checkVoiceMatchTranscript(userTxt)) {
+            return;
+          }
         } else if (msg.type === 'response.created') {
           aiResponseInFlight = true;
         } else if (msg.type === 'response.output_item.added' && msg.item && msg.item.type === 'function_call' && msg.item.call_id) {
@@ -6636,6 +6836,9 @@
   async function sendAiCommand(text) {
     const clean = String(text || '').trim();
     if (!clean) return;
+    if (typeof checkVoiceMatchTranscript === 'function' && checkVoiceMatchTranscript(clean)) {
+      return;
+    }
     appendAiLog('user', clean);
     if (aiSendBtn) aiSendBtn.disabled = true;
     if (window.TrevaVos) {
@@ -7031,6 +7234,195 @@
       setTimeout(() => window.TrevaVos.syncCanvasSize(), 40);
     }
   }
+
+  function setPureVoiceMenuOpen(open) {
+    if (!cockpitShell) return;
+    const nextOpen = Boolean(open);
+    cockpitShell.classList.toggle('vos-pure-voice-open', nextOpen);
+    if (togglePureVoiceBtn) {
+      togglePureVoiceBtn.classList.toggle('active', nextOpen);
+    }
+    if (window.TrevaVos) {
+      setTimeout(() => window.TrevaVos.syncCanvasSize(), 40);
+    }
+  }
+
+  function isPureVoiceMenuOpen() {
+    return Boolean(cockpitShell && cockpitShell.classList.contains('vos-pure-voice-open'));
+  }
+
+  // ===========================================================================
+  // MULTILINGUAL WAKE ("HOLA TREVA" / "HELLO TREVA") & SLEEP ("CHAU TREVA" / "GOODBYE TREVA") SENTINEL
+  // ===========================================================================
+  const vosVoiceMatchFlash = document.getElementById('vosVoiceMatchFlash');
+  const vosVmfIcon = document.getElementById('vosVmfIcon');
+  const vosVmfPhrase = document.getElementById('vosVmfPhrase');
+  const vosVmfAction = document.getElementById('vosVmfAction');
+  const vosVmfScore = document.getElementById('vosVmfScore');
+  const vosSentinelOrb = document.getElementById('vosSentinelOrb');
+  const vosSentinelStateBadge = document.getElementById('vosSentinelStateBadge');
+  const vosSentinelMatchChip = document.getElementById('vosSentinelMatchChip');
+  const vosSentinelToggleBtn = document.getElementById('vosSentinelToggleBtn');
+  let voiceMatchFlashTimer = null;
+  let voiceMatchSentinel = null;
+
+  function showVoiceMatchFlashBanner(match) {
+    if (!match) return;
+    const isWake = match.intent === 'wake';
+    const pct = Math.round(Number(match.confidence || 0.96) * 100);
+    if (vosVoiceMatchFlash) {
+      vosVoiceMatchFlash.classList.remove('hidden', 'is-wake', 'is-sleep');
+      vosVoiceMatchFlash.classList.add(isWake ? 'is-wake' : 'is-sleep');
+      if (vosVmfIcon) vosVmfIcon.innerHTML = isWake ? '&#9889;' : '&#128075;';
+      if (vosVmfPhrase) vosVmfPhrase.textContent = `"${match.phrase}"`;
+      if (vosVmfAction) {
+        vosVmfAction.textContent = isWake
+          ? 'Voice Link Enabled • Voice Menu Opened'
+          : 'Voice Link Stopped • Voice Menu Hidden';
+      }
+      if (vosVmfScore) vosVmfScore.textContent = `${pct}% MATCH`;
+      if (voiceMatchFlashTimer) clearTimeout(voiceMatchFlashTimer);
+      voiceMatchFlashTimer = setTimeout(() => {
+        vosVoiceMatchFlash.classList.add('hidden');
+      }, 4200);
+    }
+    if (vosSentinelOrb) {
+      vosSentinelOrb.classList.remove('is-wake', 'is-sleep');
+      vosSentinelOrb.classList.add(isWake ? 'is-wake' : 'is-sleep');
+      setTimeout(() => {
+        if (vosSentinelOrb) vosSentinelOrb.classList.remove('is-wake', 'is-sleep');
+      }, 2800);
+    }
+    if (vosSentinelMatchChip) {
+      vosSentinelMatchChip.textContent = `${pct}% • "${match.phrase}"`;
+    }
+  }
+
+  function handleVoiceWakeMatch(match) {
+    showVoiceMatchFlashBanner(match);
+    setPureVoiceMenuOpen(true);
+    if (window.TrevaVos) {
+      if (typeof window.TrevaVos.pulseCommandJoin === 'function') {
+        window.TrevaVos.pulseCommandJoin();
+      }
+      window.TrevaVos.pushLog('VOICE', `Wake Match ("${match.phrase}") -> Voice Menu opened & Voice Link enabled`, 'ok');
+    }
+    showToast(`Voice Match: "${match.phrase}" — Opening Voice Menu & enabling Voice Link!`, 'success');
+    if (!aiActive) {
+      startRealtimeVoice(false);
+    }
+  }
+
+  function handleVoiceSleepMatch(match) {
+    showVoiceMatchFlashBanner(match);
+    if (aiDc && aiDc.readyState === 'open') {
+      try {
+        aiDc.send(JSON.stringify({ type: 'response.cancel' }));
+      } catch (_) {}
+    }
+    if (aiActive) {
+      stopRealtimeVoice('goodbye_voice_match');
+    }
+    setPureVoiceMenuOpen(false);
+    if (window.TrevaVos) {
+      window.TrevaVos.pushLog('VOICE', `Goodbye Match ("${match.phrase}") -> Voice Link stopped & Voice Menu hidden`, 'info');
+    }
+    showToast(`Voice Match: "${match.phrase}" — Voice Link stopped & Voice Menu hidden.`, 'info');
+  }
+
+  function checkVoiceMatchTranscript(text) {
+    if (voiceMatchSentinel && typeof voiceMatchSentinel.checkExternalTranscript === 'function') {
+      return voiceMatchSentinel.checkExternalTranscript(text);
+    }
+    if (window.TrevaVoiceMatch && typeof window.TrevaVoiceMatch.evaluateTranscript === 'function') {
+      const m = window.TrevaVoiceMatch.evaluateTranscript(text, {
+        isVoiceActive: Boolean(aiActive),
+        isVoiceMenuOpen: isPureVoiceMenuOpen()
+      });
+      if (m) {
+        window.TrevaVoiceMatch.playVoiceMatchChime(m.intent);
+        if (m.intent === 'wake') handleVoiceWakeMatch(m);
+        else handleVoiceSleepMatch(m);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function initVoiceMatchSentinel() {
+    if (!window.TrevaVoiceMatch || typeof window.TrevaVoiceMatch.createSentinel !== 'function') return;
+    voiceMatchSentinel = window.TrevaVoiceMatch.createSentinel({
+      enabled: true,
+      lang: 'es-AR',
+      cooldownMs: 1600,
+      isVoiceActive: () => Boolean(aiActive),
+      isVoiceMenuOpen: () => isPureVoiceMenuOpen(),
+      isAiSpeaking: () => Boolean(aiResponseInFlight),
+      onHeard: (transcript) => {
+        if (vosSentinelMatchChip && transcript) {
+          const snippet = String(transcript).trim().slice(-24);
+          if (snippet) {
+            vosSentinelMatchChip.textContent = `MIC: "${snippet}"`;
+          }
+        }
+      },
+      onWake: (match) => handleVoiceWakeMatch(match),
+      onSleep: (match) => handleVoiceSleepMatch(match),
+      onStateChange: (st) => {
+        if (!vosSentinelStateBadge) return;
+        if (!st.supported) {
+          vosSentinelStateBadge.textContent = 'VOICE MATCH • TEXT/WEBRTC';
+        } else if (!st.enabled) {
+          vosSentinelStateBadge.textContent = 'WAKE MIC • PAUSED';
+        } else if (st.permissionDenied) {
+          vosSentinelStateBadge.textContent = 'CLICK TO ARM WAKE MIC';
+        } else if (st.running) {
+          vosSentinelStateBadge.textContent = 'VOICE SENTINEL • LISTENING';
+        } else {
+          vosSentinelStateBadge.textContent = 'VOICE SENTINEL • READY';
+        }
+        if (vosSentinelToggleBtn) {
+          vosSentinelToggleBtn.classList.toggle('active', Boolean(st.enabled));
+          vosSentinelToggleBtn.textContent = st.enabled ? 'Wake Mic ON' : 'Wake Mic OFF';
+        }
+      }
+    });
+    voiceMatchSentinel.start();
+
+    if (vosSentinelToggleBtn) {
+      vosSentinelToggleBtn.addEventListener('click', () => {
+        const next = !voiceMatchSentinel.isEnabled();
+        voiceMatchSentinel.setEnabled(next);
+        showToast(
+          next
+            ? 'Hands-free Voice Match enabled — say "Hola Treva" or "Hello Treva"!'
+            : 'Hands-free Wake Mic paused.',
+          'info'
+        );
+      });
+    }
+
+    // Allow clicking the example wake/goodbye phrase badges in the HUD or Voice Menu banner to test/trigger voice match directly
+    document.querySelectorAll('.vos-vs-kw, #aiVoiceMatchMenuBanner code').forEach((el) => {
+      el.style.cursor = 'pointer';
+      el.title = 'Click or speak this phrase aloud';
+      el.addEventListener('click', () => {
+        const phrase = String(el.textContent || '').replace(/[“”"]/g, '').trim();
+        if (phrase) checkVoiceMatchTranscript(phrase);
+      });
+    });
+
+    // Re-arm SpeechRecognition on first user gesture if browser delayed mic start until interaction
+    const armOnce = () => {
+      if (voiceMatchSentinel && voiceMatchSentinel.isEnabled() && !voiceMatchSentinel.isRunning()) {
+        voiceMatchSentinel.start();
+      }
+    };
+    document.addEventListener('pointerdown', armOnce, { passive: true });
+  }
+
+  window.__trevaTestVoiceMatch = (phrase) => checkVoiceMatchTranscript(phrase);
+  initVoiceMatchSentinel();
 
   if (togglePureControlsBtn) {
     togglePureControlsBtn.addEventListener('click', () => togglePurePanel('vos-pure-controls-open', togglePureControlsBtn));
