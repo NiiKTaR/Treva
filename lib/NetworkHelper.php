@@ -152,4 +152,76 @@ class NetworkHelper
 
         return $results;
     }
+
+    public static function getClientIp(): string
+    {
+        $candidates = [
+            $_SERVER['HTTP_CF_CONNECTING_IP'] ?? '',
+            $_SERVER['HTTP_X_REAL_IP'] ?? '',
+            $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '',
+            $_SERVER['REMOTE_ADDR'] ?? ''
+        ];
+        foreach ($candidates as $raw) {
+            $raw = trim((string)$raw);
+            if ($raw === '') {
+                continue;
+            }
+            $first = trim(explode(',', $raw)[0]);
+            if (filter_var($first, FILTER_VALIDATE_IP)) {
+                return $first;
+            }
+        }
+        return '';
+    }
+
+    public static function getActiveLanSubnets(): array
+    {
+        $subnets = [];
+        foreach (self::getLanIps() as $iface) {
+            if (!empty($iface['isVirtual'])) {
+                continue;
+            }
+            $addr = trim((string)($iface['address'] ?? ''));
+            if ($addr === '' || $addr === '127.0.0.1' || str_starts_with($addr, '169.254.')) {
+                continue;
+            }
+            if (!filter_var($addr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                continue;
+            }
+            $parts = explode('.', $addr);
+            if (count($parts) === 4) {
+                $subnets[] = "{$parts[0]}.{$parts[1]}.{$parts[2]}";
+            }
+        }
+        $subnets = array_values(array_unique($subnets));
+        sort($subnets);
+        return $subnets;
+    }
+
+    public static function isHostOnCurrentLan(string $hostIp): bool
+    {
+        $hostIp = trim($hostIp);
+        if (!filter_var($hostIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return false;
+        }
+        $parts = explode('.', $hostIp);
+        if (count($parts) !== 4) {
+            return false;
+        }
+        $prefix = "{$parts[0]}.{$parts[1]}.{$parts[2]}";
+        return in_array($prefix, self::getActiveLanSubnets(), true);
+    }
+
+    public static function getClientNetworkId(): string
+    {
+        if (self::isLocalEnvironment()) {
+            $subnets = self::getActiveLanSubnets();
+            if (empty($subnets)) {
+                return 'local_no_lan';
+            }
+            return 'lan_' . substr(sha1(implode(',', $subnets)), 0, 16);
+        }
+        $ip = self::getClientIp();
+        return 'net_' . substr(sha1($ip !== '' ? $ip : 'unknown'), 0, 16);
+    }
 }

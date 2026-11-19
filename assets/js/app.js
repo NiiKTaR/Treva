@@ -63,6 +63,19 @@
   const LOCAL_VAULT_KEY = 'treva_local_vault_v1';
   const TAB_VAULT_KEY = 'treva_tab_vault_v1';
   let hydratePromise = null;
+  let currentNetworkId = '';
+  let originNetworkId = '';
+  let isMobileDataMode = false;
+
+  function detectMobileDataConnection() {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (conn && typeof conn.type === 'string') {
+      const t = conn.type.toLowerCase();
+      if (['cellular', 'wimax', 'bluetooth', 'none'].includes(t)) return true;
+      if (['wifi', 'ethernet'].includes(t)) return false;
+    }
+    return false;
+  }
 
   function getLocalCacheMode() {
     try {
@@ -87,6 +100,18 @@
     }
   }
 
+  function normalizeDevicesList(raw) {
+    if (Array.isArray(raw)) {
+      return raw.filter((d) => d && typeof d === 'object');
+    }
+    if (raw && typeof raw === 'object') {
+      return Object.entries(raw)
+        .filter(([, d]) => d && typeof d === 'object')
+        .map(([k, d]) => (d.id ? d : { id: k, ...d }));
+    }
+    return [];
+  }
+
   function hasMeaningfulVault(v) {
     if (!v || typeof v !== 'object') return false;
     const cfg = v.smartConfig || {};
@@ -97,7 +122,12 @@
     if (String(m.email || '').trim() || String(m.password || '').trim() || String(m.token || '').trim()) return true;
     if (String(o.apiKey || '').trim()) return true;
     if (v.smartDevices && (Array.isArray(v.smartDevices) ? v.smartDevices.length > 0 : Object.keys(v.smartDevices).length > 0)) return true;
-    if (v.devices && (Array.isArray(v.devices) ? v.devices.length > 0 : Object.keys(v.devices).length > 0)) return true;
+    if (normalizeDevicesList(v.devices).length > 0) return true;
+    if (
+      v.devicesByNetwork &&
+      typeof v.devicesByNetwork === 'object' &&
+      Object.values(v.devicesByNetwork).some((entry) => normalizeDevicesList(entry).length > 0)
+    ) return true;
     if (v.smartScenes && Array.isArray(v.smartScenes.scenes) && v.smartScenes.scenes.length > 0) return true;
     return false;
   }
@@ -106,12 +136,26 @@
     if (!vault || typeof vault !== 'object') return;
     const mode = getLocalCacheMode();
     try {
-      // Never persist physical Cast devices across browser closes in localStorage so moving to
-      // another smart home starts clean and discovers active devices in that home.
-      const toStore = mode === 'session'
-        ? vault
-        : { ...vault, devices: [] };
-      const serialized = JSON.stringify(toStore);
+      const prev = readLocalVault() || {};
+      const byNet = (prev.devicesByNetwork && typeof prev.devicesByNetwork === 'object')
+        ? { ...prev.devicesByNetwork }
+        : {};
+      const vaultToSave = { ...vault };
+      const netKey = currentNetworkId || vault.networkId || '';
+      const normDevices = normalizeDevicesList(vault.devices);
+      if (isMobileDataMode) {
+        vaultToSave.devices = [];
+        vaultToSave.networkId = 'mobile_data';
+      } else {
+        vaultToSave.devices = normDevices;
+        if (netKey && netKey !== 'mobile_data') {
+          byNet[netKey] = normDevices;
+          vaultToSave.networkId = netKey;
+        }
+      }
+      vaultToSave.devicesByNetwork = byNet;
+
+      const serialized = JSON.stringify(vaultToSave);
       if (mode === 'session') {
         if (window.sessionStorage) window.sessionStorage.setItem(TAB_VAULT_KEY, serialized);
         if (window.localStorage) window.localStorage.removeItem(LOCAL_VAULT_KEY);
@@ -189,16 +233,30 @@
   async function hydrateServerSession(vault, silent = true) {
     if (!hasMeaningfulVault(vault)) return null;
     if (hydratePromise) return hydratePromise;
-    const sanitizedVault = getLocalCacheMode() === 'session'
-      ? vault
-      : { ...vault, devices: [] };
+    isMobileDataMode = detectMobileDataConnection();
+    const targetNetId = isMobileDataMode ? 'mobile_data' : (currentNetworkId || vault.networkId || '');
+    let devicesForNet = [];
+    if (!isMobileDataMode && targetNetId) {
+      const netList = vault.devicesByNetwork ? normalizeDevicesList(vault.devicesByNetwork[targetNetId]) : [];
+      if (netList.length > 0) {
+        devicesForNet = netList;
+      } else if (!vault.networkId || vault.networkId === targetNetId) {
+        devicesForNet = normalizeDevicesList(vault.devices);
+      }
+    }
+    const scopedVault = {
+      ...vault,
+      networkId: targetNetId,
+      isMobileData: isMobileDataMode,
+      devices: devicesForNet
+    };
     hydratePromise = (async () => {
       try {
         const res = await fetch(apiUrl('session_hydrate'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
-          body: JSON.stringify({ vault: sanitizedVault })
+          body: JSON.stringify({ vault: scopedVault })
         });
         const data = await res.json();
         if (!res.ok || data.error) {
@@ -252,6 +310,54 @@
     } catch (err) {
       showToast(err.message || 'Failed to clear local session', 'error');
     }
+  }
+
+  async function flushCastDevicesForNetworkChange(newNetId, reasonToast = '') {
+    try {
+      if (typeof stopRawMdxSession === 'function') stopRawMdxSession();
+      if (activeCastSession) {
+        userStoppedSdkCast = true;
+        try { activeCastSession.endSession(true); } catch (_) {}
+        if (typeof updateSdkUi === 'function') updateSdkUi(null);
+      }
+    } catch (_) {}
+
+    devices = [];
+    currentNetworkId = newNetId || (isMobileDataMode ? 'mobile_data' : '');
+    renderDevices(true);
+    syncVosState();
+
+    try {
+      const res = await fetch(apiUrl('cast_flush'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({ isMobileData: isMobileDataMode, networkId: currentNetworkId })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data) {
+        persistSessionVaultFromResponse(data);
+      }
+    } catch (_) {}
+
+    if (reasonToast) {
+      showToast(reasonToast, 'info');
+    }
+  }
+
+  const netConn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (netConn && typeof netConn.addEventListener === 'function') {
+    netConn.addEventListener('change', async () => {
+      const nowMobile = detectMobileDataConnection();
+      if (nowMobile && !isMobileDataMode) {
+        isMobileDataMode = true;
+        await flushCastDevicesForNetworkChange('mobile_data', 'Switched to Mobile Data — Cast devices flushed. SmartLife & MagicHome cloud ready.');
+      } else if (!nowMobile && isMobileDataMode) {
+        isMobileDataMode = false;
+        currentNetworkId = originNetworkId || '';
+        if (typeof loadServerInfo === 'function') await loadServerInfo(false);
+      }
+    });
   }
 
   // Chrome Cast SDK state
@@ -438,11 +544,22 @@
 
   const LAN_BRIDGE_STORAGE_KEY = 'treva_lan_bridge_url_v1';
   const DIAG_SUBNET_STORAGE_KEY = 'treva_diag_subnet_v1';
+  const DIAG_SUBNET_BY_NET_KEY = 'treva_diag_subnet_by_net_v1';
   let localLanBridgeBase = '';
   let lanBridgeProbeDone = false;
   let lanBridgeReachable = false;
   let lastLanDiagReport = null;
   let lanDiagRunning = false;
+  let browserCastScanPromise = null;
+  let lnaPermissionWatcherAttached = false;
+  let castScanState = {
+    active: false,
+    foundCount: 0,
+    subnet: '',
+    ssid: '',
+    permission: 'unknown', // 'granted' | 'prompt' | 'denied' | 'unsupported' | 'unknown'
+    message: ''
+  };
   const LAN_BRIDGE_ACTIONS = new Set([
     'discover',
     'manual_device',
@@ -452,6 +569,8 @@
     'cast_volume',
     'cast_sync',
     'cast_sync_all',
+    'cast_auto_connect',
+    'cast_flush',
     'cast_media',
     'smart_discover',
     'smart_scan_wifi',
@@ -562,21 +681,48 @@
     return null;
   }
 
+  function getSavedSubnetForNetwork(netId = '') {
+    const key = String(netId || currentNetworkId || originNetworkId || '').trim();
+    if (key && key !== 'mobile_data') {
+      try {
+        const raw = window.localStorage ? window.localStorage.getItem(DIAG_SUBNET_BY_NET_KEY) : '';
+        const map = raw ? JSON.parse(raw) : null;
+        if (map && typeof map === 'object' && /^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(map[key] || ''))) {
+          return String(map[key]);
+        }
+      } catch (_) {}
+    }
+    return '';
+  }
+
+  function saveSubnetForNetwork(subnet, netId = '') {
+    const clean = String(subnet || '').trim().replace(/\.\*|\.\d+\/\d+$/, '');
+    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(clean)) return;
+    const key = String(netId || currentNetworkId || originNetworkId || '').trim();
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(DIAG_SUBNET_STORAGE_KEY, clean);
+        if (key && key !== 'mobile_data') {
+          const raw = window.localStorage.getItem(DIAG_SUBNET_BY_NET_KEY);
+          const map = (raw ? JSON.parse(raw) : {}) || {};
+          map[key] = clean;
+          window.localStorage.setItem(DIAG_SUBNET_BY_NET_KEY, JSON.stringify(map));
+        }
+      }
+    } catch (_) {}
+  }
+
   async function detectBrowserSubnetPrefix(customSubnet = '') {
     const cleanCustom = String(customSubnet || '').trim().replace(/\.\*|\.\d+\/\d+$/, '');
     if (/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(cleanCustom)) {
-      try {
-        if (window.localStorage) window.localStorage.setItem(DIAG_SUBNET_STORAGE_KEY, cleanCustom);
-      } catch (_) {}
-      return cleanCustom;
+      saveSubnetForNetwork(cleanCustom);
+      return { prefix: cleanCustom, confident: true };
     }
 
-    try {
-      const saved = window.localStorage ? window.localStorage.getItem(DIAG_SUBNET_STORAGE_KEY) : '';
-      if (saved && /^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(saved)) {
-        return saved;
-      }
-    } catch (_) {}
+    const savedForNet = getSavedSubnetForNetwork();
+    if (savedForNet) {
+      return { prefix: savedForNet, confident: true };
+    }
 
     // 1. WebRTC local ICE candidate IPv4 inspection
     if (typeof RTCPeerConnection !== 'undefined') {
@@ -614,76 +760,553 @@
           finish('');
         }
       });
-      if (rtcIp) return rtcIp;
+      if (rtcIp) {
+        saveSubnetForNetwork(rtcIp);
+        return { prefix: rtcIp, confident: true };
+      }
     }
 
-    // 2. Check serverInfo or cached local vault device IPs
+    // 2. Check serverInfo or active devices on THIS network
     if (serverInfo && serverInfo.selectedLanIp) {
       const m = /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/.exec(serverInfo.selectedLanIp);
-      if (m && m[1] !== '127.0.0') return m[1];
+      if (m && m[1] !== '127.0.0') return { prefix: m[1], confident: true };
     }
-    const vault = readLocalVault();
     const allKnownIps = [
       ...(devices || []).map((d) => d.host),
-      ...(smartDevices || []).map((d) => d.ip),
-      ...((vault && Array.isArray(vault.devices)) ? vault.devices.map((d) => d.host) : []),
-      ...((vault && Array.isArray(vault.smartDevices)) ? vault.smartDevices.map((d) => d.ip) : [])
+      ...(smartDevices || []).map((d) => d.ip)
     ].filter(Boolean);
     for (const ip of allKnownIps) {
       const m = /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/.exec(String(ip));
-      if (m && m[1] !== '127.0.0') return m[1];
+      if (m && m[1] !== '127.0.0') return { prefix: m[1], confident: true };
     }
 
-    return '192.168.1';
+    return { prefix: '192.168.100', confident: false };
   }
 
-  async function probeLanPortTiming(ip, port, scheme = 'http', timeoutMs = 420) {
+  function classifyCastVariantJs(model = '', capabilities = 0) {
+    const lower = String(model || '').toLowerCase();
+    if (lower.includes('group')) return 'cast_group';
+    if (lower.includes('hub') || lower.includes('display')) return 'nest_hub';
+    if (lower.includes('google tv') || lower.includes('android tv') || lower.includes('shield') || lower.includes('bravia')) {
+      return 'google_tv';
+    }
+    if (
+      lower.includes('mini') ||
+      lower.includes('nest audio') ||
+      lower.includes('google home') ||
+      lower.includes('chromecast audio') ||
+      lower.includes('speaker')
+    ) {
+      return 'nest_speaker';
+    }
+    return ((capabilities & 1) === 1 || lower.includes('chromecast')) ? 'chromecast' : 'nest_speaker';
+  }
+
+  function parseEurekaCastDevice(ip, info) {
+    if (!info || typeof info !== 'object') return null;
+    const friendlyName = String(info.name || '').trim();
+    const rawUdn = String(info.ssdp_udn || (info.device_info && info.device_info.ssdp_udn) || '').trim();
+    if (!friendlyName && !rawUdn) return null;
+
+    const id = rawUdn ? rawUdn.replace(/-/g, '').toLowerCase() : `${ip}:8009`;
+    const ssid = String(info.ssid || (info.wifi && info.wifi.ssid) || '').trim();
+    const bssid = String(info.bssid || (info.wifi && info.wifi.bssid) || '').trim();
+    const capsObj = (info.device_info && info.device_info.capabilities && typeof info.device_info.capabilities === 'object')
+      ? info.device_info.capabilities
+      : {};
+    const hasDisplayHints = Boolean(
+      capsObj.display_supported ||
+      Object.prototype.hasOwnProperty.call(info, 'closed_caption') ||
+      info.hdmi_control
+    );
+    let model = String(
+      (info.detail && info.detail.model_name) ||
+      (info.device_info && info.device_info.model_name) ||
+      ''
+    ).trim();
+    if (!model) {
+      model = hasDisplayHints ? 'Chromecast' : 'Google Cast Speaker';
+    }
+    const lowerModel = model.toLowerCase();
+    const isAudioModel =
+      lowerModel.includes('mini') ||
+      lowerModel.includes('nest audio') ||
+      lowerModel.includes('google home') ||
+      lowerModel.includes('chromecast audio') ||
+      lowerModel.includes('speaker') ||
+      lowerModel.includes('group');
+    const capabilities = hasDisplayHints && !isAudioModel ? 5 : 4;
+    const kind = (capabilities & 1) === 1 ? 'display' : 'speaker';
+    const variant = classifyCastVariantJs(model, capabilities);
+
+    const dev = {
+      id,
+      name: friendlyName || `Cast (${ip})`,
+      model,
+      variant,
+      host: ip,
+      port: 8009,
+      capabilities,
+      kind,
+      supportsVideo: kind === 'display',
+      supportsAudio: true,
+      online: true,
+      isManual: false,
+      isSdkOnly: false,
+      status: 'IDLE',
+      discoverySource: 'browser_lan'
+    };
+    if (ssid) dev.ssid = ssid;
+    if (bssid) dev.bssid = bssid;
+    return dev;
+  }
+
+  async function checkBrowserLocalNetworkAccess() {
+    if (window.location.protocol === 'http:') {
+      return { supported: true, state: 'granted', useLna: false, permStatus: null };
+    }
+    if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+      for (const permName of ['local-network', 'local-network-access']) {
+        try {
+          const permStatus = await navigator.permissions.query({ name: permName });
+          if (permStatus && permStatus.state) {
+            if (!lnaPermissionWatcherAttached && typeof permStatus.addEventListener === 'function') {
+              lnaPermissionWatcherAttached = true;
+              permStatus.addEventListener('change', () => {
+                castScanState.permission = permStatus.state;
+                if (permStatus.state === 'granted' && !isMobileDataMode && !detectMobileDataConnection()) {
+                  discoverBrowserLanCastDevices({ silent: false, interactive: false, fullSweep: true });
+                } else {
+                  syncVosState();
+                }
+              });
+            }
+            return { supported: true, state: permStatus.state, useLna: true, permStatus };
+          }
+        } catch (_) {}
+      }
+    }
+    return { supported: false, state: 'unsupported', useLna: false, permStatus: null };
+  }
+
+  async function verifyAndClassifyBrowserCastHost(ip, useLna = false, ms = 0) {
+    // 1. Confirm Google Cast receiver via /setup/icon.png (301 redirect to gstatic eureka_device.png with CORS header)
+    let confirmedCast = false;
+    try {
+      const c1 = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const t1 = c1 ? setTimeout(() => c1.abort(), 700) : null;
+      const o1 = { mode: 'cors', redirect: 'manual', cache: 'no-store', signal: c1 ? c1.signal : undefined };
+      if (useLna) o1.targetAddressSpace = 'local';
+      const iconRes = await fetch(`http://${ip}:8008/setup/icon.png`, o1);
+      if (t1) clearTimeout(t1);
+      if (iconRes && (iconRes.type === 'opaqueredirect' || iconRes.status === 301 || iconRes.status === 302 || iconRes.ok)) {
+        confirmedCast = true;
+      }
+    } catch (_) {}
+    if (!confirmedCast) return null;
+
+    // 2. Distinguish Chromecast / Google TV displays (DIAL /apps/ChromeCast reflects CORS 200/404) from Nest Audio speakers (rejects CORS on /apps/*)
+    let isDisplay = false;
+    try {
+      const c2 = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const t2 = c2 ? setTimeout(() => c2.abort(), 700) : null;
+      const o2 = { mode: 'cors', cache: 'no-store', signal: c2 ? c2.signal : undefined };
+      if (useLna) o2.targetAddressSpace = 'local';
+      const dialRes = await fetch(`http://${ip}:8008/apps/ChromeCast`, o2);
+      if (t2) clearTimeout(t2);
+      if (dialRes && (dialRes.type === 'cors' || dialRes.ok || dialRes.status === 200 || dialRes.status === 403 || dialRes.status === 404)) {
+        isDisplay = true;
+      }
+    } catch (_) {}
+
+    // 3. Preserve real friendly name/UDN if already known on this Wi-Fi (from cast_networks.json, local vault, or SDK)
+    const knownMatch = (devices || []).find((d) => d && d.host === ip && Number(d.port || 8009) === 8009);
+    const kind = (knownMatch && knownMatch.kind) || (isDisplay ? 'display' : 'speaker');
+    const model = (knownMatch && knownMatch.model) || (kind === 'display' ? 'Chromecast / Google TV (Wi-Fi LAN)' : 'Google Nest Speaker (Wi-Fi LAN)');
+    const capabilities = (knownMatch && knownMatch.capabilities) || (kind === 'display' ? 5 : 4);
+    const variant = (knownMatch && knownMatch.variant) || classifyCastVariantJs(model, capabilities);
+    const id = (knownMatch && knownMatch.id && !String(knownMatch.id).startsWith('manual-'))
+      ? String(knownMatch.id)
+      : `cast-lan-${ip.replace(/\./g, '-')}`;
+    const name = (knownMatch && knownMatch.name) || (kind === 'display' ? `Chromecast (${ip})` : `Google Nest (${ip})`);
+
+    return {
+      id,
+      name,
+      model,
+      variant,
+      host: ip,
+      port: 8009,
+      capabilities,
+      kind,
+      supportsVideo: kind === 'display',
+      supportsAudio: true,
+      online: true,
+      isManual: false,
+      isSdkOnly: false,
+      status: (knownMatch && knownMatch.status) || 'IDLE',
+      discoverySource: 'browser_lan',
+      ms
+    };
+  }
+
+  async function fetchBrowserCastEureka(ip, timeoutMs = 600, useLna = false, externalSignal = null) {
     const start = performance.now();
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+    const onExternalAbort = () => {
+      if (ctrl) ctrl.abort();
+    };
+    if (externalSignal && typeof externalSignal.addEventListener === 'function') {
+      if (externalSignal.aborted) {
+        if (timer) clearTimeout(timer);
+        return null;
+      }
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
     try {
-      await fetch(`${scheme}://${ip}:${port}/`, {
-        mode: 'no-cors',
+      const url = `http://${ip}:8008/setup/eureka_info?params=name,detail,device_info,net,wifi`;
+      const opts = {
+        mode: 'cors',
         cache: 'no-store',
         signal: ctrl ? ctrl.signal : undefined
-      });
+      };
+      if (useLna) {
+        opts.targetAddressSpace = 'local';
+      }
+      const res = await fetch(url, opts);
       if (timer) clearTimeout(timer);
-      return { reachable: true, status: 'open', ms: Math.round(performance.now() - start) };
-    } catch (err) {
+      const elapsedMs = Math.round(performance.now() - start);
+      if (res.ok) {
+        const info = await res.json().catch(() => null);
+        const parsed = parseEurekaCastDevice(ip, info);
+        if (parsed) {
+          parsed.ms = elapsedMs;
+          return parsed;
+        }
+      }
+      // Modern Google Cast firmware returns HTTP 404 WITH Access-Control-Allow-Origin reflected to browser User-Agents.
+      // Because mode:'cors' only resolves when the host explicitly allows this origin, verify via /setup/icon.png & /apps/ChromeCast!
+      if (res.status === 404 && res.type === 'cors') {
+        return await verifyAndClassifyBrowserCastHost(ip, useLna, elapsedMs);
+      }
+      return null;
+    } catch (_) {
       if (timer) clearTimeout(timer);
-      const elapsed = Math.round(performance.now() - start);
-      const isAbort = (err && err.name === 'AbortError') || elapsed >= timeoutMs - 25;
-      return { reachable: !isAbort && elapsed < 260, status: isAbort ? 'timeout' : 'fast_HandshakeOrReset', ms: elapsed };
+      return null;
+    } finally {
+      if (externalSignal && typeof externalSignal.removeEventListener === 'function') {
+        externalSignal.removeEventListener('abort', onExternalAbort);
+      }
     }
   }
 
-  async function probeHostOnLan(ip) {
-    // Compare target device ports against an unused control port on the same IP
-    const [castTls, castHttp, mhPort, ctrlPort] = await Promise.all([
-      probeLanPortTiming(ip, 8009, 'https', 420),
-      probeLanPortTiming(ip, 8008, 'http', 400),
-      probeLanPortTiming(ip, 5577, 'http', 380),
-      probeLanPortTiming(ip, 59183, 'http', 380)
-    ]);
+  function mergeBrowserCastDevicesLocally(foundList) {
+    if (!Array.isArray(foundList) || foundList.length === 0) return devices;
+    const byId = new Map();
+    (devices || []).forEach((d) => {
+      if (d && d.id) byId.set(String(d.id), d);
+    });
+    foundList.forEach((f) => {
+      if (!f || !f.id) return;
+      const prev = byId.get(String(f.id)) || {};
+      // Drop synthetic manual-<ip>-8009 duplicate if same IP is now matched by real Cast UDN
+      for (const [exId, exDev] of Array.from(byId.entries())) {
+        if (exId !== String(f.id) && exId.startsWith('manual-') && exDev && exDev.host === f.host && Number(exDev.port || 8009) === Number(f.port || 8009)) {
+          byId.delete(exId);
+        }
+      }
+      byId.set(String(f.id), {
+        volume: 0.7,
+        muted: false,
+        status: 'IDLE',
+        ...prev,
+        ...f,
+        online: true,
+        isSdkOnly: false
+      });
+    });
+    devices = Array.from(byId.values());
+    renderDevices(true);
+    syncVosState();
+    return devices;
+  }
 
-    const openPorts = [];
-    if (castHttp.status === 'open' || (castHttp.reachable && (!ctrlPort.reachable || Math.abs(castHttp.ms - ctrlPort.ms) > 18))) {
-      openPorts.push({ port: 8008, protocol: 'Cast Eureka HTTP', ms: castHttp.ms });
+  async function syncBrowserDiscoveredCastDevices(foundList, pruneMissing = false) {
+    if (isMobileDataMode || detectMobileDataConnection()) return null;
+    if (!Array.isArray(foundList) || foundList.length === 0) return null;
+    try {
+      const res = await fetch(apiUrl('lan_diag_sync'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({
+          castDevices: foundList,
+          smartDevices: [],
+          isMobileData: false,
+          pruneMissing: Boolean(pruneMissing)
+        })
+      });
+      if (!res.ok) return null;
+      const syncData = await res.json().catch(() => null);
+      if (syncData && syncData.networkId && !localLanBridgeBase) {
+        currentNetworkId = String(syncData.networkId);
+        if (currentNetworkId !== 'mobile_data') originNetworkId = currentNetworkId;
+      }
+      if (syncData && Array.isArray(syncData.devices)) {
+        devices = normalizeDevicesList(syncData.devices);
+        renderDevices(true);
+        persistSessionVaultFromResponse(syncData);
+        syncVosState();
+      }
+      return syncData;
+    } catch (_) {
+      return null;
     }
-    if (castTls.status === 'open' || (castTls.reachable && (!ctrlPort.reachable || Math.abs(castTls.ms - ctrlPort.ms) > 15))) {
-      openPorts.push({ port: 8009, protocol: 'CastV2 TLS', ms: castTls.ms });
+  }
+
+  async function discoverBrowserLanCastDevices(opts = {}) {
+    if (isMobileDataMode || detectMobileDataConnection()) {
+      castScanState = { active: false, foundCount: 0, subnet: '', ssid: '', permission: 'mobile_data', message: 'Mobile Data active — Cast disabled.' };
+      syncVosState();
+      return { devices: [], subnet: '', permission: 'mobile_data' };
     }
-    if (mhPort.status === 'open') {
-      openPorts.push({ port: 5577, protocol: 'MagicHome TCP', ms: mhPort.ms });
+    if (browserCastScanPromise && !opts.customSubnet) {
+      return browserCastScanPromise;
     }
 
-    const hostAlive = openPorts.length > 0 || castTls.reachable || castHttp.reachable || ctrlPort.reachable;
-    return {
-      ip,
-      hostAlive,
-      ms: Math.min(castTls.ms, castHttp.ms, ctrlPort.ms),
-      openPorts
-    };
+    const silent = opts.silent !== false;
+    const interactive = Boolean(opts.interactive);
+    const fullSweep = opts.fullSweep !== false;
+
+    const run = (async () => {
+      const subnetInfo = await detectBrowserSubnetPrefix(opts.customSubnet || '');
+      let activeSubnet = subnetInfo.prefix;
+      const lna = await checkBrowserLocalNetworkAccess();
+      castScanState = {
+        ...castScanState,
+        active: true,
+        subnet: activeSubnet,
+        permission: lna.state,
+        message: lna.state === 'prompt'
+          ? 'Waiting for browser Local Network permission to auto-connect Wi-Fi Cast devices...'
+          : `Scanning Wi-Fi (${activeSubnet}.x) for Google Cast devices...`
+      };
+      syncVosState();
+
+      if (!lna.supported && !interactive) {
+        castScanState = {
+          ...castScanState,
+          active: false,
+          permission: 'unsupported',
+          message: 'Direct HTTPS->LAN scan requires Chrome 142+ Local Network Access or HTTP mode.'
+        };
+        syncVosState();
+        return { devices: [], subnet: activeSubnet, permission: 'unsupported' };
+      }
+      if (lna.state === 'denied') {
+        castScanState = {
+          ...castScanState,
+          active: false,
+          permission: 'denied',
+          message: 'Local Network permission blocked — allow Local Network access in browser site settings.'
+        };
+        if (interactive) {
+          showToast('Local Network access is blocked in browser site settings. Allow "Local network" for www.knowhereco.ar to auto-connect Cast devices.', 'error');
+        }
+        syncVosState();
+        return { devices: [], subnet: activeSubnet, permission: 'denied' };
+      }
+
+      const useLna = lna.useLna || window.location.protocol === 'https:';
+      const discoveredMap = new Map();
+      const probedIps = new Set();
+
+      const recordFoundBatch = async (foundBatch, syncNow = true) => {
+        const fresh = [];
+        foundBatch.forEach((dev) => {
+          if (!dev || !dev.id) return;
+          discoveredMap.set(dev.id, dev);
+          fresh.push(dev);
+        });
+        if (fresh.length === 0) return;
+        const firstSsid = fresh.find((d) => d.ssid)?.ssid || castScanState.ssid;
+        const firstHost = fresh[0].host || '';
+        const hostSub = /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/.exec(firstHost);
+        if (hostSub && hostSub[1]) {
+          activeSubnet = hostSub[1];
+          saveSubnetForNetwork(activeSubnet);
+        }
+        castScanState = {
+          ...castScanState,
+          foundCount: discoveredMap.size,
+          subnet: activeSubnet,
+          ssid: firstSsid || '',
+          permission: 'granted',
+          message: `Connected ${discoveredMap.size} Cast device(s)${firstSsid ? ` on ${firstSsid}` : ''} — finishing Wi-Fi sweep...`
+        };
+        mergeBrowserCastDevicesLocally(fresh);
+        if (syncNow) {
+          await syncBrowserDiscoveredCastDevices(Array.from(discoveredMap.values()), false);
+        }
+      };
+
+      // If browser needs a Local Network Access prompt, send ONE warm-up request first so all waves don't timeout while user clicks Allow.
+      if (lna.state === 'prompt' || (!lna.supported && interactive)) {
+        const knownCastIp = (devices || []).find((d) => d && d.host && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(d.host))?.host;
+        const warmupIp = knownCastIp || `${activeSubnet}.7`;
+        const warmupCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        let postGrantAbortTimer = null;
+        const onPermChange = () => {
+          if (!lna.permStatus || !warmupCtrl) return;
+          if (lna.permStatus.state === 'granted') {
+            postGrantAbortTimer = setTimeout(() => warmupCtrl.abort(), 650);
+          } else if (lna.permStatus.state === 'denied') {
+            warmupCtrl.abort();
+          }
+        };
+        if (lna.permStatus && typeof lna.permStatus.addEventListener === 'function') {
+          lna.permStatus.addEventListener('change', onPermChange, { once: true });
+        }
+        if (window.TrevaVos) {
+          window.TrevaVos.pushLog('CAST', 'Requesting browser Local Network access for automatic Wi-Fi Cast discovery...', 'info');
+        }
+        probedIps.add(warmupIp);
+        const warmupDev = await fetchBrowserCastEureka(
+          warmupIp,
+          lna.state === 'prompt' ? 20000 : 1200,
+          useLna,
+          warmupCtrl ? warmupCtrl.signal : null
+        );
+        if (postGrantAbortTimer) clearTimeout(postGrantAbortTimer);
+        if (lna.permStatus && typeof lna.permStatus.removeEventListener === 'function') {
+          lna.permStatus.removeEventListener('change', onPermChange);
+        }
+        if (warmupDev) {
+          await recordFoundBatch([warmupDev], true);
+        } else if (lna.permStatus) {
+          const postState = lna.permStatus.state;
+          if (postState !== 'granted') {
+            castScanState = {
+              ...castScanState,
+              active: false,
+              permission: postState,
+              message: postState === 'denied'
+                ? 'Local Network permission denied.'
+                : 'Click "Auto-Connect Wi-Fi Cast" and allow Local Network access to discover Cast devices.'
+            };
+            syncVosState();
+            return { devices: [], subnet: activeSubnet, permission: postState };
+          }
+        } else if (!lna.supported) {
+          castScanState = {
+            ...castScanState,
+            active: false,
+            permission: 'unsupported',
+            message: 'Browser blocked HTTPS->LAN fetch. Use Chrome 142+ with Local Network Access or Pair Wi-Fi Cast.'
+          };
+          syncVosState();
+          return { devices: [], subnet: activeSubnet, permission: 'unsupported' };
+        }
+      }
+
+      const scanIpList = async (ips, batchSize = 36, timeoutMs = 460) => {
+        const filtered = ips.filter((ip) => ip && !probedIps.has(ip));
+        for (let i = 0; i < filtered.length; i += batchSize) {
+          if (isMobileDataMode || detectMobileDataConnection()) break;
+          const chunk = filtered.slice(i, i + batchSize);
+          chunk.forEach((ip) => probedIps.add(ip));
+          const results = await Promise.all(chunk.map((ip) => fetchBrowserCastEureka(ip, timeoutMs, useLna)));
+          const found = results.filter(Boolean);
+          if (found.length > 0) {
+            await recordFoundBatch(found, true);
+          }
+        }
+      };
+
+      // Wave 0: Verify known Cast IPs on this network immediately
+      const knownIps = Array.from(new Set(
+        (devices || [])
+          .map((d) => String(d && d.host ? d.host : '').trim())
+          .filter((ip) => /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip))
+      ));
+      if (knownIps.length > 0) {
+        await scanIpList(knownIps, 16, 520);
+      }
+
+      // Wave 1: Fast priority DHCP octets (.2-.35) on detected/remembered subnet
+      const priorityOctets = [];
+      for (let o = 2; o <= 35; o++) priorityOctets.push(o);
+      await scanIpList(priorityOctets.map((o) => `${activeSubnet}.${o}`), 34, 600);
+
+      // Multi-subnet auto-fallback if primary subnet was a guess and yielded 0 Cast devices
+      if (discoveredMap.size === 0 && !subnetInfo.confident && !opts.customSubnet) {
+        const fallbackSubnets = ['192.168.100', '192.168.0', '192.168.1', '192.168.2', '192.168.50', '10.0.0']
+          .filter((s) => s !== activeSubnet);
+        for (const candSub of fallbackSubnets) {
+          if (isMobileDataMode || detectMobileDataConnection()) break;
+          castScanState = {
+            ...castScanState,
+            subnet: candSub,
+            message: `Checking Wi-Fi subnet ${candSub}.x for Cast devices...`
+          };
+          syncVosState();
+          await scanIpList(priorityOctets.map((o) => `${candSub}.${o}`), 34, 420);
+          if (discoveredMap.size > 0) {
+            activeSubnet = candSub;
+            saveSubnetForNetwork(activeSubnet);
+            break;
+          }
+        }
+      }
+
+      // Progressive sweep (.36-.254) on the active/winning subnet
+      if (fullSweep && !isMobileDataMode && !detectMobileDataConnection()) {
+        const restIps = [];
+        for (let o = 36; o <= 254; o++) restIps.push(`${activeSubnet}.${o}`);
+        await scanIpList(restIps, 36, 420);
+      }
+
+      const finalList = Array.from(discoveredMap.values());
+      if (finalList.length > 0) {
+        await syncBrowserDiscoveredCastDevices(finalList, false);
+      }
+
+      const detectedSsid = finalList.find((d) => d.ssid)?.ssid || castScanState.ssid;
+      castScanState = {
+        active: false,
+        foundCount: finalList.length,
+        subnet: activeSubnet,
+        ssid: detectedSsid || '',
+        permission: finalList.length > 0 ? 'granted' : lna.state,
+        message: finalList.length > 0
+          ? `${finalList.length} Cast device(s) connected via Wi-Fi LAN${detectedSsid ? ` (${detectedSsid})` : ''}.`
+          : `No Cast devices answered on ${activeSubnet}.0/24.`
+      };
+      syncVosState();
+
+      if (finalList.length > 0 && window.TrevaVos) {
+        window.TrevaVos.pushLog(
+          'CAST',
+          `Auto-connected ${finalList.length} Wi-Fi Cast device(s): ${finalList.map((d) => d.name).join(', ')}`,
+          'ok'
+        );
+      }
+      if (!silent) {
+        showToast(
+          finalList.length > 0
+            ? `Connected ${finalList.length} Cast device(s) to V.O.S. Pie (${finalList.map((d) => d.name).join(', ')})`
+            : `No Cast devices responded on ${activeSubnet}.0/24 — check Wi-Fi or subnet prefix.`,
+          finalList.length > 0 ? 'success' : 'info'
+        );
+      }
+      return { devices: finalList, subnet: activeSubnet, permission: castScanState.permission };
+    })();
+
+    browserCastScanPromise = run.finally(() => {
+      browserCastScanPromise = null;
+    });
+    return browserCastScanPromise;
   }
 
   function apiUrl(action, extra = '') {
@@ -803,15 +1426,16 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Server error');
 
-      if (!data.isLocalEnvironment) {
+      if (!data.isLocalEnvironment && !detectMobileDataConnection()) {
         const bridgeInfo = await probeLocalLanBridge(forceBridgeProbe);
         if (bridgeInfo) {
           data.isLocalEnvironment = true;
           data.isLocalBridge = true;
           data.interfaces = bridgeInfo.interfaces || [];
           data.selectedLanIp = bridgeInfo.selectedLanIp || '';
-          if (Array.isArray(bridgeInfo.devices) && bridgeInfo.devices.length > 0) {
-            data.devices = bridgeInfo.devices;
+          const bridgeDevs = normalizeDevicesList(bridgeInfo.devices);
+          if (bridgeDevs.length > 0) {
+            data.devices = bridgeDevs;
           }
         }
       }
@@ -860,6 +1484,14 @@
       }
 
       if (data.streamStatus) updateTelemetry(data.streamStatus);
+      isMobileDataMode = detectMobileDataConnection();
+      const rawServerNetId = String(data.networkId || '');
+      if (rawServerNetId && rawServerNetId !== 'mobile_data') {
+        originNetworkId = rawServerNetId;
+      }
+      const serverNetId = isMobileDataMode ? 'mobile_data' : (originNetworkId || rawServerNetId);
+      if (serverNetId) currentNetworkId = serverNetId;
+
       let activePayload = data;
       if (!data.sessionHydrated) {
         const localVault = readLocalVault();
@@ -867,8 +1499,10 @@
           const restored = await hydrateServerSession(localVault, true);
           if (restored && restored.ok) {
             activePayload = { ...data, ...restored };
-            if (data.isLocalBridge && Array.isArray(data.devices) && data.devices.length > 0) {
-              activePayload.devices = data.devices;
+            const origDevs = normalizeDevicesList(data.devices);
+            const restDevs = normalizeDevicesList(restored.devices);
+            if (origDevs.length > 0 && restDevs.length === 0) {
+              activePayload.devices = origDevs;
             }
           }
         }
@@ -895,32 +1529,61 @@
 
       localScanControls.classList.remove('hidden');
       scanSmartWifiBtn.classList.remove('hidden');
-      devices = Array.isArray(activePayload.devices) ? activePayload.devices : [];
+      const localVault = readLocalVault();
+      const networkChangedFromVault = Boolean(
+        localVault && localVault.networkId && serverNetId && localVault.networkId !== serverNetId
+      );
+      if (isMobileDataMode) {
+        activePayload.devices = [];
+      }
+      const netSavedDevs = (!isMobileDataMode && localVault && serverNetId && localVault.devicesByNetwork)
+        ? normalizeDevicesList(localVault.devicesByNetwork[serverNetId])
+        : [];
+      const sameNetVaultDevs = (!isMobileDataMode && localVault && (!localVault.networkId || localVault.networkId === serverNetId))
+        ? normalizeDevicesList(localVault.devices)
+        : [];
+      const vaultFallbackDevs = netSavedDevs.length > 0 ? netSavedDevs : sameNetVaultDevs;
+      const activeDevsList = normalizeDevicesList(activePayload.devices);
+      devices = isMobileDataMode
+        ? []
+        : (activeDevsList.length > 0 ? activeDevsList : vaultFallbackDevs);
       renderDevices(true);
 
-      if (!devices || devices.length === 0) {
-        if (data.isLocalEnvironment) {
-          discoverLocalDevices(true);
-        } else {
-          runLocalNetworkDiagnostics({ silent: true, showPanel: false });
-        }
-      } else if (!data.isLocalEnvironment) {
-        runLocalNetworkDiagnostics({ silent: true, showPanel: false });
-      }
       updateLocalSessionStatusUi();
       syncVosState(data.streamStatus || null);
+      if (isMobileDataMode) {
+        await flushCastDevicesForNetworkChange('mobile_data', 'Mobile Data active — Cast devices flushed. SmartLife & MagicHome cloud ready.');
+      } else {
+        if (networkChangedFromVault && devices.length === 0) {
+          await flushCastDevicesForNetworkChange(serverNetId, 'Wi-Fi changed — old Cast devices flushed.');
+        }
+        autoConnectCastDevicesForPie(false);
+      }
       if (smartConfig && smartConfig.tuya && smartConfig.tuya.configured) {
         syncSmartScenes(true);
       }
     } catch (err) {
+      isMobileDataMode = detectMobileDataConnection();
       const offlineVault = readLocalVault();
       if (offlineVault) {
+        if (isMobileDataMode) {
+          devices = [];
+        } else {
+          const offlineByNet = (offlineVault.devicesByNetwork && currentNetworkId)
+            ? normalizeDevicesList(offlineVault.devicesByNetwork[currentNetworkId])
+            : [];
+          const offlineDirect = (!offlineVault.networkId || !currentNetworkId || offlineVault.networkId === currentNetworkId)
+            ? normalizeDevicesList(offlineVault.devices)
+            : [];
+          devices = offlineByNet.length > 0 ? offlineByNet : offlineDirect;
+        }
         if (Array.isArray(offlineVault.smartDevices)) smartDevices = offlineVault.smartDevices;
         if (offlineVault.smartScenes) smartScenes = offlineVault.smartScenes;
         if (offlineVault.smartConfig) smartConfig = offlineVault.smartConfig;
         renderDevices(true);
         renderSmartDevices(true);
         renderSmartScenes();
+        syncVosState();
       }
       serverStatusText.textContent = navigator.onLine === false ? 'Offline Local Mode' : 'Local Diagnostic Mode';
       runLocalNetworkDiagnostics({ silent: true, showPanel: true });
@@ -964,13 +1627,13 @@
       : `<div style="font-size:0.76rem;opacity:0.78;padding:4px 0;">${
           report.scanning
             ? 'Probing local subnet ' + escapeHtml(report.subnet) + '.1–254 for Cast (:8009/:8008) &amp; MagicHome (:5577)...'
-            : 'No raw TCP responses in browser sandbox on ' + escapeHtml(report.subnet) + '.x — direct Wi-Fi Chrome Cast SDK remains available, or start local XAMPP (http://localhost/Treva).'
+            : 'No Google Cast endpoints responded on ' + escapeHtml(report.subnet) + '.x — click Scan Subnet and allow browser Local Network access, or use Pair Wi-Fi Cast.'
         }</div>`;
 
     const html = `
       <div class="key-section-box" style="margin-bottom:10px;padding:10px 12px;">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
-          <strong style="font-size:0.82rem;">Local Network Diagnostic (${escapeHtml(report.subnet || '192.168.1')}.0/24)</strong>
+          <strong style="font-size:0.82rem;">Local Network Diagnostic (${escapeHtml(report.subnet || '192.168.100')}.0/24)</strong>
           <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">
             ${bridgeBadge}
             <span class="device-kind-tag">Cast SDK: ${escapeHtml(castSdkStatus)}</span>
@@ -983,7 +1646,7 @@
           ${rowsHtml}
         </div>
         <div class="cast-cmd-row" style="gap:6px;flex-wrap:wrap;">
-          <input type="text" class="text-input lan-diag-subnet-input" style="max-width:135px;padding:4px 8px;font-size:0.75rem;" value="${escapeHtml(report.subnet || '192.168.1')}" placeholder="192.168.1" title="Local /24 Subnet Prefix" />
+          <input type="text" class="text-input lan-diag-subnet-input" style="max-width:135px;padding:4px 8px;font-size:0.75rem;" value="${escapeHtml(report.subnet || '192.168.100')}" placeholder="192.168.100" title="Local /24 Subnet Prefix" />
           <button type="button" class="btn btn-primary btn-xs lan-diag-rescan-btn">${report.scanning ? 'Scanning...' : 'Scan Subnet'}</button>
           <input type="text" class="text-input lan-bridge-input" style="flex:1;min-width:160px;padding:4px 8px;font-size:0.75rem;" value="${escapeHtml(savedBridge)}" placeholder="Local Companion URL (http://localhost/Treva)" />
           <button type="button" class="btn btn-secondary btn-xs lan-bridge-connect-btn">Link Local PHP</button>
@@ -1054,7 +1717,8 @@
     const silent = Boolean(opts.silent);
     const showPanel = opts.showPanel !== false;
     try {
-      const subnet = await detectBrowserSubnetPrefix(opts.customSubnet || '');
+      const subnetInfo = await detectBrowserSubnetPrefix(opts.customSubnet || '');
+      let subnet = subnetInfo.prefix;
       const swReady = Boolean(navigator.serviceWorker && navigator.serviceWorker.controller);
       const bleSupported = Boolean(navigator.bluetooth);
       let castSdkState = 'Unavailable';
@@ -1106,15 +1770,31 @@
         }
       } catch (_) {}
 
-      // 2. Include already known Cast & Smart Wi-Fi devices in diagnostic list
+      // 2. Run direct browser Local Network Eureka (:8008) discovery when running on remote hosting without local PHP
+      if (!bridgeActive && !isMobileDataMode && !detectMobileDataConnection()) {
+        const browserRes = await discoverBrowserLanCastDevices({
+          silent: true,
+          interactive: !silent,
+          customSubnet: opts.customSubnet || '',
+          fullSweep: true
+        });
+        if (browserRes && browserRes.subnet) {
+          subnet = browserRes.subnet;
+        }
+      }
+
+      // 3. Populate active Cast & Smart Wi-Fi devices in diagnostic list
       (devices || []).forEach((d) => {
         if (!d || !d.host) return;
         endpoints.push({
           name: d.name || 'Cast Device',
           ip: d.host,
           port: d.port || 8009,
-          protocol: d.kind === 'display' ? 'Chromecast / TV (CastV2)' : 'Google Nest (CastV2)',
-          status: d.status || 'READY'
+          protocol: d.discoverySource === 'browser_lan'
+            ? (d.kind === 'display' ? 'Chromecast / TV (Wi-Fi LAN)' : 'Google Nest (Wi-Fi LAN)')
+            : (d.kind === 'display' ? 'Chromecast / TV (CastV2)' : 'Google Nest (CastV2)'),
+          status: d.status || 'READY',
+          ms: d.ms
         });
       });
       (smartDevices || []).forEach((sd) => {
@@ -1127,69 +1807,6 @@
           status: sd.online !== false ? 'ONLINE' : 'STANDBY'
         });
       });
-
-      // 3. Browser-side direct subnet port diagnostic across priority IPs on the /24 subnet
-      // Skip raw HTTP/self-signed-TLS fetch probes when running on a remote HTTPS origin to prevent
-      // browser Mixed Content / ERR_UNSAFE_PORT (6668) / ERR_CERT_AUTHORITY_INVALID console noise.
-      const isHttpsRemote = window.location.protocol === 'https:' &&
-        window.location.hostname !== 'localhost' &&
-        window.location.hostname !== '127.0.0.1';
-      const newCastFound = [];
-      const newSmartFound = [];
-
-      if (!isHttpsRemote && !silent) {
-        const knownIps = new Set(endpoints.map((e) => e.ip));
-        const candidateOctets = [7, 8, 9, 10, 11, 12, 13, 14, 15, 2, 3, 4, 5, 6, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25];
-        const probeIps = [];
-        knownIps.forEach((ip) => probeIps.push(ip));
-        candidateOctets.forEach((oct) => {
-          const ip = `${subnet}.${oct}`;
-          if (!knownIps.has(ip)) probeIps.push(ip);
-        });
-
-        const batchSize = 8;
-        for (let i = 0; i < Math.min(probeIps.length, 24); i += batchSize) {
-          const slice = probeIps.slice(i, i + batchSize);
-          const results = await Promise.all(slice.map((ip) => probeHostOnLan(ip)));
-          for (const r of results) {
-            const existing = endpoints.find((e) => e.ip === r.ip);
-            if (existing && r.ms < 400) {
-              existing.ms = r.ms;
-            }
-            if (!existing && r.openPorts.length > 0) {
-              const p0 = r.openPorts[0];
-              endpoints.push({
-                name: p0.port === 8009 || p0.port === 8008 ? `Cast Receiver (${r.ip})` : `Smart Device (${r.ip})`,
-                ip: r.ip,
-                port: p0.port,
-                protocol: p0.protocol,
-                ms: p0.ms
-              });
-              if (p0.port === 8009 || p0.port === 8008) {
-                newCastFound.push({ name: `Cast Device (${r.ip})`, host: r.ip, port: 8009, kind: 'display' });
-              } else if (p0.port === 5577) {
-                newSmartFound.push({ ip: r.ip, platform: 'magichome' });
-              }
-            }
-          }
-        }
-      }
-
-      if (newCastFound.length > 0 || newSmartFound.length > 0) {
-        try {
-          const syncRes = await fetch(apiUrl('lan_diag_sync'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ castDevices: newCastFound, smartDevices: newSmartFound })
-          });
-          if (syncRes.ok) {
-            const syncData = await syncRes.json();
-            if (Array.isArray(syncData.devices)) devices = syncData.devices;
-            if (Array.isArray(syncData.smartDevices)) smartDevices = syncData.smartDevices;
-            persistSessionVaultFromResponse(syncData);
-          }
-        } catch (_) {}
-      }
 
       renderDevices(true);
       renderSmartDevices(true);
@@ -1223,18 +1840,27 @@
   }
 
   async function discoverLocalDevices(silent = false) {
+    if (detectMobileDataConnection()) {
+      isMobileDataMode = true;
+      await flushCastDevicesForNetworkChange('mobile_data', !silent ? 'Mobile Data active — Cast devices require Wi-Fi.' : '');
+      return;
+    }
     try {
       if (!silent) showToast('Searching for active Cast devices on current Wi-Fi...');
       const res = await fetch(apiUrl('discover'), { cache: 'no-store' });
       const data = await res.json();
       if (Array.isArray(data.devices)) {
-        devices = data.devices;
+        devices = normalizeDevicesList(data.devices);
         renderDevices(true);
         persistSessionVaultFromResponse(data);
         syncVosState();
       }
-      if (!silent && serverInfo && !serverInfo.isLocalEnvironment && (!devices || devices.length === 0)) {
-        await pairActiveCastDeviceViaSdk();
+      const isRemoteWeb = !localLanBridgeBase && (!serverInfo || !serverInfo.isLocalEnvironment);
+      if (isRemoteWeb) {
+        const scanRes = await discoverBrowserLanCastDevices({ silent, interactive: !silent, fullSweep: true });
+        if (!silent && (!devices || devices.length === 0) && scanRes && (scanRes.permission === 'unsupported' || scanRes.permission === 'denied')) {
+          await pairActiveCastDeviceViaSdk();
+        }
         return;
       }
       await runLocalNetworkDiagnostics({ silent, showPanel: !silent || (!devices || devices.length === 0) });
@@ -1243,18 +1869,96 @@
     }
   }
 
+  async function autoConnectCastDevicesForPie(wakeIdle = false) {
+    if (detectMobileDataConnection()) {
+      isMobileDataMode = true;
+      await flushCastDevicesForNetworkChange('mobile_data');
+      return;
+    }
+    try {
+      const prevCachedVault = readLocalVault() || {};
+      const res = await fetch(apiUrl('cast_auto_connect'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({ wake: Boolean(wakeIdle), isMobileData: false })
+      });
+      const data = await res.json().catch(() => ({}));
+      const preservedNetId = (localLanBridgeBase && originNetworkId && originNetworkId !== 'mobile_data')
+        ? originNetworkId
+        : String((data && data.networkId) || currentNetworkId || '');
+      if (preservedNetId) {
+        currentNetworkId = preservedNetId;
+      }
+      if (res.ok && data && data.devices) {
+        devices = normalizeDevicesList(data.devices);
+        renderDevices(true);
+        if (data.sessionVault && typeof data.sessionVault === 'object') {
+          const safeSmartConfig = (hasMeaningfulVault(prevCachedVault) && prevCachedVault.smartConfig)
+            ? prevCachedVault.smartConfig
+            : (data.sessionVault.smartConfig || {});
+          persistSessionVaultFromResponse({
+            sessionVault: {
+              ...prevCachedVault,
+              ...data.sessionVault,
+              smartConfig: safeSmartConfig,
+              networkId: preservedNetId || data.sessionVault.networkId,
+              devices
+            }
+          });
+        }
+        syncVosState();
+
+        // When linked via a desktop localhost bridge, mirror discovered Cast devices up to the same-origin remote server under originNetworkId.
+        if (localLanBridgeBase && originNetworkId && originNetworkId !== 'mobile_data' && devices.length > 0) {
+          const fallbackVault = (data.sessionVault && typeof data.sessionVault === 'object') ? data.sessionVault : {};
+          const originVault = hasMeaningfulVault(prevCachedVault)
+            ? { ...fallbackVault, ...prevCachedVault, networkId: originNetworkId, isMobileData: false, devices }
+            : { ...fallbackVault, networkId: originNetworkId, isMobileData: false, devices };
+          fetch(`api.php?action=session_hydrate&sid=${encodeURIComponent(STREAM_SID)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            cache: 'no-store',
+            body: JSON.stringify({ vault: originVault })
+          }).catch(() => {});
+        }
+
+        if (wakeIdle && (localLanBridgeBase || (serverInfo && serverInfo.isLocalEnvironment)) && devices.length > 0) {
+          showToast(`Connected ${devices.length} Cast device(s) to Pie display.`, 'success');
+        }
+      }
+    } catch (_) {}
+
+    // On remote hosting (e.g. www.knowhereco.ar/Treva without localhost), directly scan local Wi-Fi via browser Local Network Access.
+    const isRemoteWeb = !localLanBridgeBase && (!serverInfo || !serverInfo.isLocalEnvironment);
+    if (isRemoteWeb && !isMobileDataMode && !detectMobileDataConnection()) {
+      await discoverBrowserLanCastDevices({
+        silent: !wakeIdle,
+        interactive: Boolean(wakeIdle),
+        fullSweep: true
+      });
+    }
+
+    if (castFrameworkReady && window.cast && window.cast.framework) {
+      try {
+        const sess = cast.framework.CastContext.getInstance().getCurrentSession();
+        if (sess) updateSdkUi(sess);
+      } catch (_) {}
+    }
+  }
+
   function startStatePolling() {
     if (pollTimer) clearInterval(pollTimer);
     // Refresh live YouTube Music / YouTube / Cast media status from Chromecast & Nest devices
     if (!startStatePolling.mediaTimer) {
       startStatePolling.mediaTimer = setInterval(async () => {
-        if (document.hidden || !serverInfo || !serverInfo.isLocalEnvironment) return;
+        if (isMobileDataMode || document.hidden || !serverInfo || !serverInfo.isLocalEnvironment) return;
         if (Date.now() < interactionLockUntil) return;
         try {
           const res = await fetch(apiUrl('cast_sync_all', '&fast=1'), { cache: 'no-store' });
           if (!res.ok) return;
           const data = await res.json();
-          if (Array.isArray(data.devices) && data.devices.length && Date.now() >= interactionLockUntil) {
+          if (Array.isArray(data.devices) && Date.now() >= interactionLockUntil) {
             devices = data.devices;
             renderDevices(false);
             syncVosState();
@@ -1271,6 +1975,30 @@
         serverDot.classList.add('online');
         if (vosPureDot) vosPureDot.classList.remove('offline');
         if (data.streamStatus) updateTelemetry(data.streamStatus);
+
+        const wasMobileData = isMobileDataMode;
+        const nowMobile = detectMobileDataConnection();
+        if (nowMobile && !wasMobileData) {
+          isMobileDataMode = true;
+          await flushCastDevicesForNetworkChange('mobile_data', 'Switched to Mobile Data — Cast devices flushed.');
+          return;
+        }
+        if (!nowMobile && wasMobileData) {
+          isMobileDataMode = false;
+          currentNetworkId = '';
+          showToast('Back on Wi-Fi — reconnecting Cast devices...', 'info');
+          await loadServerInfo(false);
+          return;
+        }
+        const srvNet = nowMobile ? 'mobile_data' : String(data.networkId || '');
+        if (!nowMobile && srvNet && currentNetworkId && srvNet !== currentNetworkId) {
+          await flushCastDevicesForNetworkChange(srvNet, 'Wi-Fi network changed — old Cast devices flushed.');
+          await loadServerInfo(false);
+          return;
+        }
+        if (srvNet && !currentNetworkId) {
+          currentNetworkId = srvNet;
+        }
 
         if (data.sessionHydrated === false) {
           const localVault = readLocalVault();
@@ -1349,6 +2077,7 @@
             ? ((activeCastSession.getCastDevice() && activeCastSession.getCastDevice().friendlyName) || 'Google Cast')
             : ''
         },
+        castScanState: { ...castScanState },
         ambientSyncActive: Boolean(ambientSyncCheckbox && ambientSyncCheckbox.checked)
       });
     }
@@ -2146,7 +2875,7 @@
         <p><strong>Remote Hosting Mode (No Local LAN Bridge Detected)</strong></p>
         <span class="empty-sub">Google Nest &amp; Chromecast only listen on your local home Wi-Fi (port 8009 / mDNS). Start XAMPP locally (<code>http://localhost/Treva</code>) or enter your PC's LAN bridge URL below to list and control them from this hosted page:</span>
         <div class="cast-cmd-row" style="margin-top:10px;max-width:420px;margin-left:auto;margin-right:auto;">
-          <input type="text" class="lan-bridge-input" value="${escapeHtml(savedBridge)}" placeholder="http://localhost/Treva or http://192.168.1.10/Treva" />
+          <input type="text" class="lan-bridge-input" value="${escapeHtml(savedBridge)}" placeholder="http://localhost/Treva or http://192.168.100.24/Treva" />
           <button type="button" class="btn btn-primary btn-xs lan-bridge-connect-btn">Connect LAN Bridge</button>
         </div>
       </div>
@@ -2487,20 +3216,26 @@
 
     if (!devices || devices.length === 0) {
       const isRemoteNoBridge = (!serverInfo || !serverInfo.isLocalEnvironment) && !localLanBridgeBase;
-      const emptyHtml = `
-        <div class="empty-devices">
-          <p>No active Google Nest or Chromecast devices loaded yet.</p>
-          <span class="empty-sub">${
-            isRemoteNoBridge
-              ? 'Click <strong>Pair Active Cast Device (Wi-Fi)</strong> to find &amp; select an active speaker or TV on this home\'s Wi-Fi via Chrome Cast, or link a local PHP bridge in <strong>Net Diag</strong>.'
-              : 'Click <strong>Scan Active Devices</strong> or <strong>Net Diag</strong> to search this Wi-Fi for active speakers &amp; TVs, or pair via Chrome Cast.'
-          }</span>
-          <div style="margin-top:8px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
-            <button type="button" class="btn btn-primary btn-xs inline-pair-sdk-btn">Pair Active Cast Device (Wi-Fi)</button>
-            <button type="button" class="btn btn-secondary btn-xs inline-run-net-diag-btn">${isRemoteNoBridge ? 'Net Diag / Local PHP' : 'Scan Active Devices'}</button>
+      const emptyHtml = isMobileDataMode
+        ? `
+          <div class="empty-devices">
+            <p>Mobile Data Mode — Google Cast devices are flushed while off local Wi-Fi. SmartLife &amp; MagicHome cloud devices remain active.</p>
           </div>
-        </div>
-      `;
+        `
+        : `
+          <div class="empty-devices">
+            <p>No active Google Nest or Chromecast devices loaded yet.</p>
+            <span class="empty-sub">${
+              isRemoteNoBridge
+                ? 'Click <strong>Pair Active Cast Device (Wi-Fi)</strong> to find &amp; select an active speaker or TV on this home\'s Wi-Fi via Chrome Cast, or link a local PHP bridge in <strong>Net Diag</strong>.'
+                : 'Click <strong>Scan Active Devices</strong> or <strong>Net Diag</strong> to search this Wi-Fi for active speakers &amp; TVs, or pair via Chrome Cast.'
+            }</span>
+            <div style="margin-top:8px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+              <button type="button" class="btn btn-primary btn-xs inline-pair-sdk-btn">Pair Active Cast Device (Wi-Fi)</button>
+              <button type="button" class="btn btn-secondary btn-xs inline-run-net-diag-btn">${isRemoteNoBridge ? 'Net Diag / Local PHP' : 'Scan Active Devices'}</button>
+            </div>
+          </div>
+        `;
       targetContainers.forEach((c) => {
         c.innerHTML = emptyHtml;
         const pairBtn = c.querySelector('.inline-pair-sdk-btn');
@@ -2696,6 +3431,20 @@
 
   async function handleCastMediaAction(deviceId, action, seconds = null, extra = {}) {
     const dev = (devices || []).find((d) => d.id === deviceId);
+    const hasLocalPhpBridge = Boolean((serverInfo && serverInfo.isLocalEnvironment) || localLanBridgeBase);
+    if (!hasLocalPhpBridge && dev && dev.host && action === 'sync_status') {
+      const lna = await checkBrowserLocalNetworkAccess();
+      const useLna = lna.useLna || window.location.protocol === 'https:';
+      const refreshed = await fetchBrowserCastEureka(dev.host, 1200, useLna);
+      if (refreshed) {
+        mergeBrowserCastDevicesLocally([refreshed]);
+        await syncBrowserDiscoveredCastDevices([refreshed], false);
+        if (!extra || !extra.silent) {
+          showToast(`${refreshed.name}: Synced over local Wi-Fi (${refreshed.host})`, 'success');
+        }
+        return;
+      }
+    }
     const body = { deviceId, action, ...(extra || {}) };
     if (seconds !== null && seconds !== undefined) body.seconds = seconds;
     try {
@@ -2714,7 +3463,27 @@
         body: JSON.stringify(body)
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.ok === false) throw new Error(data.error || `Cast ${action} failed`);
+      if (!res.ok || data.ok === false) {
+        if (!hasLocalPhpBridge && dev && dev.host && action === 'launch_app') {
+          const rawApp = String(extra.app || 'youtube').toLowerCase();
+          const dialApp = rawApp.includes('netflix') ? 'Netflix' : 'YouTube';
+          try {
+            const lna = await checkBrowserLocalNetworkAccess();
+            const dialOpts = { method: 'POST', mode: 'cors' };
+            if (lna.useLna || window.location.protocol === 'https:') {
+              dialOpts.targetAddressSpace = 'local';
+            }
+            const dialRes = await fetch(`http://${dev.host}:8008/apps/${dialApp}`, dialOpts);
+            if (dialRes.ok || dialRes.status === 201 || dialRes.status === 200) {
+              if (!extra || !extra.silent) {
+                showToast(`${dev.name}: Launched ${dialApp} directly over Wi-Fi LAN`, 'success');
+              }
+              return;
+            }
+          } catch (_) {}
+        }
+        throw new Error(data.error || `Cast ${action} failed`);
+      }
       if (data.clientAction) {
         await executeClientActions([data.clientAction]);
       } else if (Array.isArray(data.clientActions) && data.clientActions.length > 0) {
@@ -2746,13 +3515,17 @@
       const title = data.media && data.media.title && !['announce', 'play_preset', 'play_web_media'].includes(action)
         ? ` — ${data.media.title}`
         : '';
-      showToast(`${dev ? dev.name : 'Cast'}: ${labels[action] || action}${title}`, 'success');
+      if (!extra || !extra.silent) {
+        showToast(`${dev ? dev.name : 'Cast'}: ${labels[action] || action}${title}`, 'success');
+      }
       if (window.TrevaVos && typeof window.TrevaVos.recordSystemUsage === 'function') {
         window.TrevaVos.recordSystemUsage('cast', `${dev ? dev.name : 'Cast'} ${action}`, { boost: 0.28 });
       }
       syncVosState();
     } catch (err) {
-      showToast(err.message, 'error');
+      if (!extra || !extra.silent) {
+        showToast(err.message, 'error');
+      }
     }
   }
 
@@ -3097,8 +3870,11 @@
       const context = cast.framework.CastContext.getInstance();
       context.setOptions({
         receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
-        autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+        autoJoinPolicy: (chrome.cast.AutoJoinPolicy && chrome.cast.AutoJoinPolicy.TAB_AND_ORIGIN_SCOPED) || chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
       });
+
+      const curSess = context.getCurrentSession();
+      if (curSess) updateSdkUi(curSess);
 
       castFrameworkReady = true;
       if (castSdkHint) {
@@ -3171,6 +3947,23 @@
           }
         }
       );
+
+      if (cast.framework.CastContextEventType.CAST_STATE_CHANGED) {
+        context.addEventListener(
+          cast.framework.CastContextEventType.CAST_STATE_CHANGED,
+          (event) => {
+            if (isMobileDataMode) return;
+            if (event.castState === cast.framework.CastState.CONNECTED) {
+              const sess = context.getCurrentSession();
+              if (sess) updateSdkUi(sess);
+            } else if (event.castState === cast.framework.CastState.NOT_CONNECTED) {
+              if (castSdkHint) {
+                castSdkHint.textContent = 'Cast devices detected on Wi-Fi — click Cast to Nest / TV to connect via browser.';
+              }
+            }
+          }
+        );
+      }
 
       const existing = context.getCurrentSession();
       if (existing) updateSdkUi(existing);
@@ -6276,6 +7069,25 @@
       onControlSmart: (id, payload) => controlWifiSmartDevice(id, payload),
       onControlCast: (id, payload) => {
         const d = (devices || []).find((x) => x.id === id);
+        if (payload && payload.cast_auto_connect) {
+          if (!payload.silent) {
+            showToast('Auto-connecting Cast devices for Pie display...', 'info');
+          }
+          autoConnectCastDevicesForPie(Boolean(payload.wake));
+          return;
+        }
+        if (payload && payload.pair_sdk) {
+          pairActiveCastDeviceViaSdk();
+          return;
+        }
+        if (payload && payload.cast_stream === 'start') {
+          handleLocalCastStart(id);
+          return;
+        }
+        if (payload && payload.cast_stream === 'stop') {
+          handleLocalCastStop(id);
+          return;
+        }
         if (payload && payload.volume !== undefined) {
           const level = Math.max(0, Math.min(1, Number(payload.volume) / 100));
           if (d) {
@@ -6292,11 +7104,15 @@
           return;
         }
         if (payload && payload.media_action) {
-          if (window.TrevaVos) window.TrevaVos.pushLog('CAST', `${d ? d.name : id} -> ${payload.media_action}`, 'ok');
+          if (window.TrevaVos && !payload.silent) {
+            window.TrevaVos.pushLog('CAST', `${d ? d.name : id} -> ${payload.media_action}`, 'ok');
+          }
           const extra = {};
           if (payload.preset) extra.preset = payload.preset;
           if (payload.text) extra.text = payload.text;
           if (payload.app) extra.app = payload.app;
+          if (payload.query) extra.query = payload.query;
+          if (payload.silent) extra.silent = true;
           handleCastMediaAction(id, payload.media_action, payload.seconds || null, extra);
           return;
         }

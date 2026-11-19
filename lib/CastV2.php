@@ -1039,6 +1039,100 @@ class CastV2
     }
 
     /**
+     * Probe an active YouTube (233637DE) or YouTube Music (2DB7CC49) receiver session
+     * (optionally waking idle receivers when $launchIfIdle is true) and extract its MDX screenId.
+     */
+    public function probeOrConnectMdxSession(string $preferredAppId = '233637DE', bool $launchIfIdle = false): array
+    {
+        $appOrder = $preferredAppId === '2DB7CC49' ? ['2DB7CC49', '233637DE'] : ['233637DE', '2DB7CC49'];
+        $status = $this->getStatus();
+        $transportId = '';
+        $activeAppId = '';
+        $otherNonIdleRunning = false;
+
+        foreach (($status['applications'] ?? []) as $app) {
+            $aid = (string)($app['appId'] ?? '');
+            $tid = (string)($app['transportId'] ?? '');
+            if (in_array($aid, ['233637DE', '2DB7CC49'], true) && $tid !== '') {
+                if ($aid === $preferredAppId || $transportId === '') {
+                    $transportId = $tid;
+                    $activeAppId = $aid;
+                    if ($aid === $preferredAppId) {
+                        break;
+                    }
+                }
+            } elseif (empty($app['isIdleScreen']) && $tid !== '') {
+                $otherNonIdleRunning = true;
+            }
+        }
+
+        if ($transportId === '' && $launchIfIdle && !$otherNonIdleRunning) {
+            foreach ($appOrder as $tryAppId) {
+                try {
+                    $launchRid = $this->nextReqId();
+                    $this->send($this->senderId, 'receiver-0', self::NS_RECEIVER, [
+                        'type' => 'LAUNCH',
+                        'appId' => $tryAppId,
+                        'requestId' => $launchRid
+                    ]);
+                    $launchReply = $this->waitForReply($launchRid, 'RECEIVER_STATUS', 6.0);
+                    if (isset($launchReply['status']) && is_array($launchReply['status'])) {
+                        $status = $launchReply['status'];
+                    }
+                    foreach (($launchReply['status']['applications'] ?? []) as $app) {
+                        if (($app['appId'] ?? '') === $tryAppId && !empty($app['transportId'])) {
+                            $transportId = (string)$app['transportId'];
+                            $activeAppId = $tryAppId;
+                            break 2;
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // Try fallback app ID
+                }
+            }
+        }
+
+        $screenId = '';
+        if ($transportId !== '') {
+            try {
+                $this->connectTransport($transportId);
+                $this->send($this->senderId, $transportId, 'urn:x-cast:com.google.youtube.mdx', [
+                    'type' => 'getMdxSessionStatus',
+                    'requestId' => $this->nextReqId()
+                ]);
+                $deadline = microtime(true) + 3.2;
+                while (microtime(true) < $deadline) {
+                    $msg = $this->readMessage(max(0.2, $deadline - microtime(true)));
+                    if (!$msg) {
+                        continue;
+                    }
+                    if (($msg['namespace'] ?? '') === self::NS_HEARTBEAT && ($msg['data']['type'] ?? '') === 'PING') {
+                        $this->send($this->senderId, 'receiver-0', self::NS_HEARTBEAT, ['type' => 'PONG']);
+                        continue;
+                    }
+                    if (($msg['namespace'] ?? '') === 'urn:x-cast:com.google.youtube.mdx') {
+                        $screenId = (string)($msg['data']['data']['screenId'] ?? '');
+                        if ($screenId !== '') {
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                // Return discovered app state even if MDX query fails
+            }
+        }
+
+        return [
+            'mdxScreenId' => $screenId,
+            'mdxTheme' => $activeAppId === '2DB7CC49' ? 'm' : 'cl',
+            'mdxAppId' => $activeAppId ?: $preferredAppId,
+            'appId' => $activeAppId,
+            'appName' => $activeAppId === '2DB7CC49' ? 'YouTube Music' : ($activeAppId === '233637DE' ? 'YouTube' : null),
+            'receiverStatus' => $status
+        ];
+    }
+
+    /**
      * Launch the native YouTube (233637DE) or YouTube Music (2DB7CC49) Cast Receiver, negotiate an MDX screenId over CastV2,
      * bind a YouTube Lounge session in pure PHP cURL, and start playing a video or album playlist.
      */

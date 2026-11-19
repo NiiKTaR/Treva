@@ -13,3 +13,17 @@
     </Files>
 </IfModule>
 DirectoryIndex index.php index.html
+
+<IfModule mod_mime.c>
+    AddType application/manifest+json .webmanifest
+    AddType image/png .png
+</IfModule>
+
+<IfModule mod_headers.c>
+    <Files "sw.js">
+        Header set Cache-Control "no-cache, must-revalidate"
+    </Files>
+    <Files "manifest.webmanifest">
+        Header set Cache-Control "no-cache, must-revalidate"
+    </Files>
+</IfModule>

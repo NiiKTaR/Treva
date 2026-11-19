@@ -9,6 +9,7 @@ class StreamStore
     private string $baseDir;
     private string $settingsFile;
     private string $castDevicesFile;
+    private string $castNetworksFile;
     private array $memoryVault;
 
     public function __construct(?string $baseDir = null)
@@ -16,6 +17,7 @@ class StreamStore
         $this->baseDir = $baseDir ?: dirname(__DIR__) . DIRECTORY_SEPARATOR . 'data';
         $this->settingsFile = $this->baseDir . DIRECTORY_SEPARATOR . 'settings.json';
         $this->castDevicesFile = $this->baseDir . DIRECTORY_SEPARATOR . 'cast_devices.json';
+        $this->castNetworksFile = $this->baseDir . DIRECTORY_SEPARATOR . 'cast_networks.json';
         $this->memoryVault = self::defaultVault();
         if (!is_dir($this->baseDir)) {
             @mkdir($this->baseDir, 0775, true);
@@ -58,6 +60,7 @@ class StreamStore
     {
         return [
             'hydrated' => false,
+            'networkId' => '',
             'smartConfig' => self::defaultSmartConfigRaw(),
             'smartDevices' => [],
             'smartScenes' => ['homeId' => '', 'homeName' => '', 'scenes' => []],
@@ -133,6 +136,7 @@ class StreamStore
         return [
             'version' => 1,
             'updatedAt' => time(),
+            'networkId' => (string)(($v['networkId'] ?? '') ?: (class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '')),
             'smartConfig' => $rawCfg,
             'smartDevices' => is_array($v['smartDevices'] ?? null) ? $v['smartDevices'] : [],
             'smartScenes' => is_array($v['smartScenes'] ?? null) ? $v['smartScenes'] : ['homeId' => '', 'homeName' => '', 'scenes' => []],
@@ -193,22 +197,55 @@ class StreamStore
         }
 
         $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
-        $devices = $isLocalEnv ? $this->readDiskCastDevices() : [];
-        if (isset($incoming['devices']) && is_array($incoming['devices'])) {
-            foreach ($incoming['devices'] as $k => $dev) {
-                if (!is_array($dev)) continue;
-                $id = trim((string)($dev['id'] ?? $k));
-                if ($id === '') continue;
-                $dev['id'] = $id;
-                $devices[$id] = array_merge($devices[$id] ?? [], $dev);
+        $currentNetId = class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '';
+        $incomingNetId = trim((string)($incoming['networkId'] ?? ''));
+        $isMobileData = !empty($incoming['isMobileData']);
+        $networkMismatch = ($incomingNetId !== '' && $currentNetId !== '' && $incomingNetId !== $currentNetId);
+
+        if ($isMobileData) {
+            $devices = [];
+            if ($isLocalEnv) {
+                $this->writeDiskCastDevices([]);
             }
-        }
-        if ($isLocalEnv && !empty($devices)) {
-            $this->writeDiskCastDevices($devices);
+        } else {
+            $devices = $isLocalEnv ? $this->readDiskCastDevices() : [];
+            if (empty($devices) && self::isPersistableNetworkId($currentNetId)) {
+                $devices = $this->readNetworkCastDevices($currentNetId);
+            }
+
+            $incomingNetDevices = ($currentNetId !== '' && isset($incoming['devicesByNetwork'][$currentNetId]) && is_array($incoming['devicesByNetwork'][$currentNetId]))
+                ? $incoming['devicesByNetwork'][$currentNetId]
+                : null;
+            $allowRemoteDevices = !$isLocalEnv && ($incomingNetId === '' || $incomingNetId === $currentNetId);
+            $sourceList = is_array($incomingNetDevices)
+                ? $incomingNetDevices
+                : ((!$networkMismatch && ($isLocalEnv || $allowRemoteDevices) && isset($incoming['devices']) && is_array($incoming['devices']))
+                    ? $incoming['devices']
+                    : null);
+
+            if (is_array($sourceList)) {
+                foreach ($sourceList as $k => $dev) {
+                    if (!is_array($dev)) continue;
+                    $id = trim((string)($dev['id'] ?? $k));
+                    if ($id === '') continue;
+                    $dev['id'] = $id;
+                    if ($isLocalEnv && !empty($dev['host']) && empty($dev['isSdkOnly']) && class_exists('NetworkHelper') && !NetworkHelper::isHostOnCurrentLan((string)$dev['host'])) {
+                        continue;
+                    }
+                    $devices[$id] = array_merge($devices[$id] ?? [], $dev);
+                }
+            }
+            if ($isLocalEnv) {
+                $this->writeDiskCastDevices($devices);
+            }
+            if (!empty($devices) && self::isPersistableNetworkId($currentNetId)) {
+                $this->writeNetworkCastDevices($currentNetId, $devices);
+            }
         }
 
         $vault = [
             'hydrated' => true,
+            'networkId' => $isMobileData ? 'mobile_data' : $currentNetId,
             'smartConfig' => $rawCfg,
             'smartDevices' => $smartDevices,
             'smartScenes' => $smartScenes,
@@ -221,8 +258,12 @@ class StreamStore
 
     public function clearSessionVault(): void
     {
+        $currentNetId = class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '';
         $this->memoryVault = self::defaultVault();
         @unlink($this->castDevicesFile);
+        if (self::isPersistableNetworkId($currentNetId)) {
+            $this->writeNetworkCastDevices($currentNetId, []);
+        }
         if (session_status() === PHP_SESSION_ACTIVE) {
             $_SESSION['treva_vault'] = $this->memoryVault;
             unset($_SESSION['treva_tuya_tokens']);
@@ -366,6 +407,9 @@ class StreamStore
                 if (!is_array($dev)) continue;
                 $id = trim((string)($dev['id'] ?? $k));
                 if ($id === '') continue;
+                if (!empty($dev['host']) && empty($dev['isSdkOnly']) && class_exists('NetworkHelper') && !NetworkHelper::isHostOnCurrentLan((string)$dev['host'])) {
+                    continue;
+                }
                 $dev['id'] = $id;
                 $out[$id] = $dev;
             }
@@ -380,40 +424,219 @@ class StreamStore
         });
     }
 
-    public function getDevices(): array
+    private static function isPersistableNetworkId(string $networkId): bool
     {
-        $v = $this->readVault();
+        return $networkId !== '' && $networkId !== 'mobile_data' && $networkId !== 'local_no_lan';
+    }
+
+    private static function filterCastDevicesMap(array $rawDevices, bool $checkLocalLan): array
+    {
+        $out = [];
+        foreach ($rawDevices as $k => $dev) {
+            if (!is_array($dev)) continue;
+            $id = trim((string)($dev['id'] ?? $k));
+            if ($id === '') continue;
+            if (
+                $checkLocalLan &&
+                empty($dev['isManual']) &&
+                empty($dev['isSdkOnly']) &&
+                !empty($dev['host']) &&
+                class_exists('NetworkHelper') &&
+                !NetworkHelper::isHostOnCurrentLan((string)$dev['host'])
+            ) {
+                continue;
+            }
+            $dev['id'] = $id;
+            $out[$id] = $dev;
+        }
+        return $out;
+    }
+
+    private function readNetworkCastDevices(string $networkId): array
+    {
+        if (!self::isPersistableNetworkId($networkId)) {
+            return [];
+        }
+        $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
+        return $this->withJsonLock('cast_networks', false, function () use ($networkId, $isLocalEnv) {
+            $all = $this->readJsonFileRaw($this->castNetworksFile);
+            if (!is_array($all) || !isset($all[$networkId]['devices']) || !is_array($all[$networkId]['devices'])) {
+                return [];
+            }
+            return self::filterCastDevicesMap($all[$networkId]['devices'], $isLocalEnv);
+        });
+    }
+
+    private function writeNetworkCastDevices(string $networkId, array $devicesById): void
+    {
+        if (!self::isPersistableNetworkId($networkId)) {
+            return;
+        }
+        $this->withJsonLock('cast_networks', true, function () use ($networkId, $devicesById) {
+            $all = $this->readJsonFileRaw($this->castNetworksFile);
+            if (!is_array($all)) {
+                $all = [];
+            }
+            $all[$networkId] = [
+                'updatedAt' => time(),
+                'devices' => $devicesById
+            ];
+            if (count($all) > 20) {
+                uasort($all, static function ($a, $b) {
+                    return (int)($b['updatedAt'] ?? 0) <=> (int)($a['updatedAt'] ?? 0);
+                });
+                $all = array_slice($all, 0, 20, true);
+            }
+            $this->writeJsonFileRaw($this->castNetworksFile, $all);
+        });
+    }
+
+    private function currentDevicesForMutation(array $v, string $currentNetId = ''): array
+    {
+        if ($currentNetId === '' && class_exists('NetworkHelper')) {
+            $currentNetId = NetworkHelper::getClientNetworkId();
+        }
         $mem = is_array($v['devices'] ?? null) ? $v['devices'] : [];
         if (!empty($mem)) {
             return $mem;
         }
-        $disk = $this->readDiskCastDevices();
-        if (!empty($disk)) {
-            $v['devices'] = $disk;
-            $this->writeVault($v);
-            return $disk;
+        $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
+        if ($isLocalEnv) {
+            $disk = $this->readDiskCastDevices();
+            if (!empty($disk)) {
+                return $disk;
+            }
+        }
+        if (self::isPersistableNetworkId($currentNetId)) {
+            return $this->readNetworkCastDevices($currentNetId);
         }
         return [];
     }
 
-    public function saveDevices(array $devicesById): array
+    private function commitDevicesState(array $v, array $devicesById, ?string $networkId = null, bool $markHydrated = true): array
     {
-        $v = $this->readVault();
+        $resolvedNetId = $networkId !== null
+            ? $networkId
+            : (class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '');
+        if ($resolvedNetId === '' && !empty($v['networkId'])) {
+            $resolvedNetId = (string)$v['networkId'];
+        }
         $v['devices'] = $devicesById;
-        $v['hydrated'] = true;
+        if ($resolvedNetId !== '') {
+            $v['networkId'] = $resolvedNetId;
+        }
+        if ($markHydrated) {
+            $v['hydrated'] = true;
+        }
         $this->writeVault($v);
         if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
             $this->writeDiskCastDevices($devicesById);
         }
+        if ($resolvedNetId !== 'mobile_data') {
+            $this->writeNetworkCastDevices($resolvedNetId, $devicesById);
+        }
         return $devicesById;
+    }
+
+    public function exitMobileDataForCurrentNetwork(): array
+    {
+        $v = $this->readVault();
+        if (($v['networkId'] ?? '') !== 'mobile_data') {
+            return [];
+        }
+        $currentNetId = class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '';
+        $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
+        $devs = $isLocalEnv ? $this->readDiskCastDevices() : [];
+        if (empty($devs) && self::isPersistableNetworkId($currentNetId)) {
+            $devs = $this->readNetworkCastDevices($currentNetId);
+        }
+        $v['networkId'] = $currentNetId;
+        $v['devices'] = $devs;
+        $this->writeVault($v);
+        return $devs;
+    }
+
+    public function getDevices(): array
+    {
+        $v = $this->readVault();
+        $currentNetId = class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '';
+        $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
+
+        if (($v['networkId'] ?? '') === 'mobile_data') {
+            if (!empty($v['devices'])) {
+                $v['devices'] = [];
+                $this->writeVault($v);
+            }
+            return [];
+        }
+
+        if (!empty($v['networkId']) && $currentNetId !== '' && $v['networkId'] !== $currentNetId) {
+            $devs = $this->readNetworkCastDevices($currentNetId);
+            $v['devices'] = $devs;
+            $v['networkId'] = $currentNetId;
+            $this->writeVault($v);
+            if ($isLocalEnv) {
+                $this->writeDiskCastDevices($devs);
+            }
+            return $devs;
+        }
+
+        $mem = is_array($v['devices'] ?? null) ? $v['devices'] : [];
+        $devs = $mem;
+        $restored = false;
+        if (empty($devs) && $isLocalEnv) {
+            $devs = $this->readDiskCastDevices();
+            $restored = !empty($devs);
+        }
+        if (empty($devs) && self::isPersistableNetworkId($currentNetId)) {
+            $devs = $this->readNetworkCastDevices($currentNetId);
+            $restored = !empty($devs);
+        }
+
+        if ($isLocalEnv && !empty($devs)) {
+            $filtered = self::filterCastDevicesMap($devs, true);
+            if (count($filtered) !== count($devs)) {
+                return $this->commitDevicesState($v, $filtered, $currentNetId !== '' ? $currentNetId : null, false);
+            }
+        }
+
+        if ($restored || ($currentNetId !== '' && empty($v['networkId']))) {
+            $v['devices'] = $devs;
+            if ($currentNetId !== '') {
+                $v['networkId'] = $currentNetId;
+            }
+            $this->writeVault($v);
+            if ($restored && $isLocalEnv && !empty($devs)) {
+                $this->writeDiskCastDevices($devs);
+            }
+        }
+        return $devs;
+    }
+
+    public function saveDevices(array $devicesById): array
+    {
+        return $this->commitDevicesState($this->readVault(), $devicesById, null, true);
+    }
+
+    public function flushCastDevices(?string $networkId = null): array
+    {
+        $v = $this->readVault();
+        $v['devices'] = [];
+        $v['networkId'] = $networkId ?? (class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '');
+        $v['hydrated'] = true;
+        $this->writeVault($v);
+        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
+            $this->writeDiskCastDevices([]);
+        }
+        return [];
     }
 
     public function mergeDiscoveredDevices(array $discoveredList, bool $pruneMissingAuto = false): array
     {
         $v = $this->readVault();
-        $existing = is_array($v['devices'] ?? null) && !empty($v['devices'])
-            ? $v['devices']
-            : $this->readDiskCastDevices();
+        $currentNetId = class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '';
+        $isLocalEnv = !class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment();
+        $existing = $this->currentDevicesForMutation($v, $currentNetId);
         $now = time();
         $discoveredIds = [];
         foreach ($discoveredList as $d) {
@@ -422,8 +645,13 @@ class StreamStore
             }
         }
 
+        $shouldPrune = $pruneMissingAuto;
         foreach ($existing as $id => &$dev) {
-            if ($pruneMissingAuto && empty($dev['isManual']) && empty($dev['isSdkOnly']) && !isset($discoveredIds[$id])) {
+            if ($isLocalEnv && !empty($dev['host']) && empty($dev['isSdkOnly']) && class_exists('NetworkHelper') && !NetworkHelper::isHostOnCurrentLan((string)$dev['host'])) {
+                unset($existing[$id]);
+                continue;
+            }
+            if ($shouldPrune && empty($dev['isManual']) && empty($dev['isSdkOnly']) && !isset($discoveredIds[$id])) {
                 unset($existing[$id]);
                 continue;
             }
@@ -434,9 +662,55 @@ class StreamStore
         unset($dev);
 
         foreach ($discoveredList as $d) {
-            $id = $d['id'];
+            $id = (string)$d['id'];
+            $dHost = trim((string)($d['host'] ?? ''));
+            $dPort = (int)($d['port'] ?? 8009);
+            $dName = trim((string)($d['name'] ?? ''));
+            $isPlaceholderId = str_starts_with($id, 'cast-lan-');
+
+            // If a browser CORS fingerprint probe (cast-lan-*) finds an IP already registered with a real Cast UDN/name on this Wi-Fi, preserve its real ID & friendly name.
+            if ($isPlaceholderId && $dHost !== '') {
+                foreach ($existing as $exId => $exDev) {
+                    if (
+                        !str_starts_with((string)$exId, 'manual-') &&
+                        !str_starts_with((string)$exId, 'cast-lan-') &&
+                        ($exDev['host'] ?? '') === $dHost &&
+                        (int)($exDev['port'] ?? 8009) === $dPort
+                    ) {
+                        $id = (string)$exId;
+                        $d['id'] = $id;
+                        if (!empty($exDev['name'])) {
+                            $d['name'] = $exDev['name'];
+                        }
+                        if (!empty($exDev['model']) && str_contains((string)($d['model'] ?? ''), '(Wi-Fi LAN)')) {
+                            $d['model'] = $exDev['model'];
+                        }
+                        if (!empty($exDev['ssid']) && empty($d['ssid'])) {
+                            $d['ssid'] = $exDev['ssid'];
+                        }
+                        break;
+                    }
+                }
+            }
+
             $prev = $existing[$id] ?? [];
-            $existing[$id] = array_merge($prev, $d, [
+
+            // Clean up legacy synthetic manual-<ip>-<port>, cast-lan-*, or sdk-* duplicates when a real Cast UDN is discovered for the same endpoint/name.
+            foreach ($existing as $exId => $exDev) {
+                if ((string)$exId === $id) continue;
+                $isLegacyManual = str_starts_with((string)$exId, 'manual-') && $dHost !== '' && ($exDev['host'] ?? '') === $dHost && (int)($exDev['port'] ?? 8009) === $dPort;
+                $isLegacyPlaceholder = !$isPlaceholderId && str_starts_with((string)$exId, 'cast-lan-') && $dHost !== '' && ($exDev['host'] ?? '') === $dHost && (int)($exDev['port'] ?? 8009) === $dPort;
+                $isLegacySdk = !empty($exDev['isSdkOnly']) && $dName !== '' && strcasecmp(trim((string)($exDev['name'] ?? '')), $dName) === 0;
+                if ($isLegacyManual || $isLegacyPlaceholder || $isLegacySdk) {
+                    if (empty($prev)) {
+                        $prev = $exDev;
+                    }
+                    unset($existing[$exId]);
+                }
+            }
+
+            $merged = array_merge($prev, $d, [
+                'id' => $id,
                 'lastSeen' => $now,
                 'online' => true,
                 'isSdkOnly' => false,
@@ -444,30 +718,25 @@ class StreamStore
                 'volume' => $prev['volume'] ?? 0.7,
                 'muted' => $prev['muted'] ?? false
             ]);
+            if (empty($merged['mdxAppId'])) {
+                $merged['mdxAppId'] = ($d['kind'] ?? '') === 'display' ? '233637DE' : '2DB7CC49';
+            }
+            if (empty($merged['mdxTheme'])) {
+                $merged['mdxTheme'] = ($d['kind'] ?? '') === 'display' ? 'cl' : 'm';
+            }
+            $existing[$id] = $merged;
         }
 
-        $v['devices'] = $existing;
-        $v['hydrated'] = true;
-        $this->writeVault($v);
-        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
-            $this->writeDiskCastDevices($existing);
-        }
-        return $existing;
+        return $this->commitDevicesState($v, $existing, $currentNetId !== '' ? $currentNetId : null, true);
     }
 
     public function updateDevice(string $id, array $patch): ?array
     {
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
-            ? $v['devices']
-            : $this->readDiskCastDevices();
+        $devices = $this->currentDevicesForMutation($v);
         if (!isset($devices[$id])) return null;
         $devices[$id] = array_merge($devices[$id], $patch);
-        $v['devices'] = $devices;
-        $this->writeVault($v);
-        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
-            $this->writeDiskCastDevices($devices);
-        }
+        $this->commitDevicesState($v, $devices, null, false);
         return $devices[$id];
     }
 
@@ -484,9 +753,7 @@ class StreamStore
             : 'sdk-' . substr(sha1(strtolower($name . '|' . $kind)), 0, 16);
 
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
-            ? $v['devices']
-            : $this->readDiskCastDevices();
+        $devices = $this->currentDevicesForMutation($v);
 
         // Reuse matching existing device by exact case-insensitive name if present on this Wi-Fi
         $targetId = $sdkId;
@@ -494,6 +761,22 @@ class StreamStore
             if (strcasecmp(trim((string)($exDev['name'] ?? '')), $name) === 0) {
                 $targetId = (string)$exId;
                 break;
+            }
+        }
+        // If no name match yet, upgrade a single unnamed browser_lan placeholder (cast-lan-*) of the same kind so its IP and real name unify automatically
+        if ($targetId === $sdkId) {
+            $placeholders = [];
+            foreach ($devices as $exId => $exDev) {
+                if (
+                    str_starts_with((string)$exId, 'cast-lan-') &&
+                    ($exDev['kind'] ?? '') === $kind &&
+                    preg_match('/^(Chromecast|Google Nest|Cast Device)\s*\(\d{1,3}\./i', (string)($exDev['name'] ?? ''))
+                ) {
+                    $placeholders[] = (string)$exId;
+                }
+            }
+            if (count($placeholders) === 1) {
+                $targetId = $placeholders[0];
             }
         }
 
@@ -535,12 +818,7 @@ class StreamStore
         }
 
         $devices[$targetId] = $entry;
-        $v['devices'] = $devices;
-        $v['hydrated'] = true;
-        $this->writeVault($v);
-        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
-            $this->writeDiskCastDevices($devices);
-        }
+        $this->commitDevicesState($v, $devices, null, true);
         return $entry;
     }
 
@@ -552,9 +830,7 @@ class StreamStore
         }
         $id = 'manual-' . preg_replace('/[^a-zA-Z0-9_.-]/', '-', $host) . '-' . $port;
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
-            ? $v['devices']
-            : $this->readDiskCastDevices();
+        $devices = $this->currentDevicesForMutation($v);
         $devices[$id] = [
             'id' => $id,
             'name' => trim($name) !== '' ? trim($name) : "Google Nest ({$host})",
@@ -572,27 +848,16 @@ class StreamStore
             'muted' => false,
             'lastSeen' => time()
         ];
-        $v['devices'] = $devices;
-        $v['hydrated'] = true;
-        $this->writeVault($v);
-        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
-            $this->writeDiskCastDevices($devices);
-        }
+        $this->commitDevicesState($v, $devices, null, true);
         return $devices[$id];
     }
 
     public function removeDevice(string $id): void
     {
         $v = $this->readVault();
-        $devices = is_array($v['devices'] ?? null) && !empty($v['devices'])
-            ? $v['devices']
-            : $this->readDiskCastDevices();
+        $devices = $this->currentDevicesForMutation($v);
         unset($devices[$id]);
-        $v['devices'] = $devices;
-        $this->writeVault($v);
-        if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
-            $this->writeDiskCastDevices($devices);
-        }
+        $this->commitDevicesState($v, $devices, null, false);
     }
 
     // =========================================================================

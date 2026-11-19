@@ -227,6 +227,8 @@ try {
         $snap = buildSceneSnapshot($store);
         echo json_encode(withSessionVault($store, [
             'ok' => true,
+            'networkId' => NetworkHelper::getClientNetworkId(),
+            'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
             'devices' => array_values($store->getDevices()),
             'smartConfig' => $store->getSmartConfigPublic(),
             'smartDevices' => $store->getSmartDevicesPublic(),
@@ -279,6 +281,8 @@ try {
             'ok' => true,
             'sessionHydrated' => $store->hasSessionVaultData(),
             'isLocalEnvironment' => $isLocal,
+            'networkId' => NetworkHelper::getClientNetworkId(),
+            'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
             'selectedLanIp' => $selectedLanIp,
             'interfaces' => $interfaces,
             'uiUrl' => $endpoints['uiUrl'],
@@ -304,6 +308,8 @@ try {
         echo json_encode([
             'ok' => true,
             'sessionHydrated' => $store->hasSessionVaultData(),
+            'networkId' => NetworkHelper::getClientNetworkId(),
+            'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
             'streamStatus' => $store->getStreamStatus($sid),
             'devices' => array_values($store->getDevices()),
             'smartDevices' => $store->getSmartDevicesPublic()
@@ -352,6 +358,8 @@ try {
         echo json_encode(withSessionVault($store, [
             'ok' => true,
             'remoteHosting' => !$isLocal,
+            'networkId' => NetworkHelper::getClientNetworkId(),
+            'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
             'devices' => $synced
         ]));
         exit;
@@ -370,16 +378,76 @@ try {
 
     if ($action === 'lan_diag_sync') {
         $body = readJsonBody();
+        if (!empty($body['isMobileData'])) {
+            $store->flushCastDevices('mobile_data');
+            echo json_encode(withSessionVault($store, [
+                'ok' => true,
+                'networkId' => 'mobile_data',
+                'devices' => [],
+                'smartDevices' => $store->getSmartDevicesPublic()
+            ]));
+            exit;
+        }
         $castEndpoints = is_array($body['castDevices'] ?? null) ? $body['castDevices'] : [];
         $smartEndpoints = is_array($body['smartDevices'] ?? null) ? $body['smartDevices'] : [];
+        $discoveredCast = [];
         foreach ($castEndpoints as $ep) {
             if (!is_array($ep)) continue;
             $host = trim((string)($ep['host'] ?? ''));
             if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) continue;
             $port = (int)($ep['port'] ?? 8009);
+            $port = ($port > 0 && $port <= 65535) ? $port : 8009;
+            $rawId = trim((string)($ep['id'] ?? ($ep['ssdp_udn'] ?? '')));
+            if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $rawId)) {
+                $normId = strtolower(str_replace('-', '', $rawId));
+            } else {
+                $normId = $rawId !== ''
+                    ? strtolower(preg_replace('/[^a-zA-Z0-9._:-]/', '', $rawId))
+                    : ($host . ':' . $port);
+            }
+            if ($normId === '') {
+                $normId = $host . ':' . $port;
+            }
             $name = trim((string)($ep['name'] ?? '')) ?: "Cast Device ({$host})";
-            $kind = in_array($ep['kind'] ?? '', ['speaker', 'display'], true) ? $ep['kind'] : 'display';
-            $store->addManualDevice($name, $host, $port > 0 ? $port : 8009, $kind);
+            $kind = in_array($ep['kind'] ?? '', ['speaker', 'display'], true) ? $ep['kind'] : '';
+            $model = trim((string)($ep['model'] ?? ''));
+            $capabilities = isset($ep['capabilities']) ? (int)$ep['capabilities'] : ($kind === 'display' ? 5 : 4);
+            if ($kind === '') {
+                $kind = CastMdns::classifyDevice($model, $capabilities);
+            }
+            if ($model === '') {
+                $model = $kind === 'display' ? 'Chromecast' : 'Google Cast Speaker';
+            }
+            $variant = trim((string)($ep['variant'] ?? ''));
+            if ($variant === '') {
+                $variant = CastMdns::classifyVariant($model, $capabilities);
+            }
+            $entry = [
+                'id' => $normId,
+                'name' => $name,
+                'model' => $model,
+                'variant' => $variant,
+                'host' => $host,
+                'port' => $port,
+                'capabilities' => $capabilities,
+                'kind' => $kind,
+                'supportsVideo' => $kind === 'display',
+                'supportsAudio' => true,
+                'online' => true,
+                'isManual' => false,
+                'discoverySource' => trim((string)($ep['discoverySource'] ?? 'browser_lan')) ?: 'browser_lan'
+            ];
+            if (!empty($ep['ssid'])) {
+                $entry['ssid'] = trim((string)$ep['ssid']);
+            }
+            if (!empty($ep['bssid'])) {
+                $entry['bssid'] = trim((string)$ep['bssid']);
+            }
+            $discoveredCast[] = $entry;
+        }
+        if (!empty($discoveredCast)) {
+            $store->exitMobileDataForCurrentNetwork();
+            $store->mergeDiscoveredDevices($discoveredCast, !empty($body['pruneMissing']));
         }
         foreach ($smartEndpoints as $sep) {
             if (!is_array($sep)) continue;
@@ -398,6 +466,7 @@ try {
         }
         echo json_encode(withSessionVault($store, [
             'ok' => true,
+            'networkId' => NetworkHelper::getClientNetworkId(),
             'devices' => array_values($store->getDevices()),
             'smartDevices' => $store->getSmartDevicesPublic()
         ]));
@@ -552,6 +621,42 @@ try {
             ? SmartController::syncAllCastDevices($store, 1.4, $onlyStale, 4)
             : array_values($store->getDevices());
         echo json_encode(['ok' => true, 'devices' => $synced]);
+        exit;
+    }
+
+    if ($action === 'cast_auto_connect') {
+        $body = readJsonBody();
+        if (!empty($body['isMobileData']) || !empty($_GET['mobileData'])) {
+            $store->flushCastDevices('mobile_data');
+            echo json_encode(withSessionVault($store, [
+                'ok' => true,
+                'networkId' => 'mobile_data',
+                'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
+                'devices' => []
+            ]));
+            exit;
+        }
+        $wake = !empty($body['wake']) || !empty($_GET['wake']);
+        $synced = SmartController::autoConnectCastDevices($store, $wake);
+        echo json_encode(withSessionVault($store, [
+            'ok' => true,
+            'networkId' => NetworkHelper::getClientNetworkId(),
+            'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
+            'devices' => $synced
+        ]));
+        exit;
+    }
+
+    if ($action === 'cast_flush') {
+        $body = readJsonBody();
+        $netId = !empty($body['isMobileData']) ? 'mobile_data' : NetworkHelper::getClientNetworkId();
+        $store->flushCastDevices($netId);
+        echo json_encode(withSessionVault($store, [
+            'ok' => true,
+            'networkId' => $netId,
+            'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
+            'devices' => []
+        ]));
         exit;
     }
 
@@ -776,7 +881,7 @@ try {
         $warning = null;
 
         if ($ip !== '' && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            throw new InvalidArgumentException('Wi-Fi IP must be a valid IPv4 address (e.g. 192.168.1.50)');
+            throw new InvalidArgumentException('Wi-Fi IP must be a valid IPv4 address (e.g. 192.168.100.6)');
         }
 
         if ($platform === 'magichome') {

@@ -72,6 +72,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     captureState: { active: false, audioLevel: 0, mode: '' },
     btOutput: { active: false, label: '' },
     castSdk: { active: false, device: '' },
+    castScanState: { active: false, foundCount: 0, subnet: '', ssid: '', permission: 'unknown', message: '' },
     ambientSyncActive: false,
     logs: [],
     selectedDeviceId: '',
@@ -2586,6 +2587,8 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
         platform: 'google_cast',
         category: 'cast',
         ip: c.host || '',
+        ssid: c.ssid || '',
+        discoverySource: c.discoverySource || '',
         online: true,
         power: playing,
         brightness: Math.round(((c.volume ?? 0.7) * 100)),
@@ -5489,6 +5492,156 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     if (els.smAssignToggleBtn) els.smAssignToggleBtn.classList.remove('active');
   }
 
+  function buildCastBusQuickHtml() {
+    const castDevs = state.castDevices || [];
+    const scan = state.castScanState || {};
+    const scanStatusLine = scan.active
+      ? `<div class="vos-insp-row" style="padding:4px 6px;border-radius:6px;background:rgba(56,189,248,0.12);"><span class="vos-insp-hex">${escapeHtml(scan.message || 'Scanning local Wi-Fi for Cast devices...')}</span></div>`
+      : (scan.message && (castDevs.length === 0 || scan.permission === 'denied' || scan.permission === 'prompt' || scan.ssid))
+        ? `<div class="vos-insp-row" style="padding:3px 6px;"><span class="vos-insp-hex">${escapeHtml(scan.message)}</span></div>`
+        : '';
+    const devRows = castDevs.length > 0
+      ? castDevs.map((cd) => {
+          const st = String(cd.status || 'IDLE').toUpperCase();
+          const cdPlaying = st === 'PLAYING' || st === 'BUFFERING';
+          return `
+            <div class="vos-insp-row" style="justify-content:space-between;gap:6px;padding:4px 6px;border-radius:8px;background:rgba(15,23,42,0.45);">
+              <span class="vos-insp-hex" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                <strong>${escapeHtml(cd.name || cd.host || 'Cast')}</strong> &bull; ${escapeHtml(st)}
+              </span>
+              <span style="display:flex;gap:4px;flex-shrink:0;">
+                <button type="button" class="btn btn-xs ${cdPlaying ? 'btn-danger' : 'btn-primary'} vos-bus-cast-btn" data-id="${escapeHtml(cd.id)}" data-stream="${cdPlaying ? 'stop' : 'start'}">${cdPlaying ? 'Stop' : 'Cast Now'}</button>
+                <button type="button" class="btn btn-xs btn-secondary vos-bus-open-btn" data-id="${escapeHtml(cd.id)}">Open</button>
+              </span>
+            </div>
+          `;
+        }).join('')
+      : `<div class="vos-empty" style="padding:6px;">${
+          scan.active
+            ? 'Auto-scanning local Wi-Fi for Google Cast devices...'
+            : 'No Cast targets discovered yet. Click Auto-Connect Wi-Fi Cast to scan your local network.'
+        }</div>`;
+
+    return `
+      <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:6px;margin-top:6px;">
+        <button type="button" class="btn btn-sm btn-primary vos-bus-auto-btn">${scan.active ? 'Scanning Wi-Fi...' : 'Auto-Connect Wi-Fi Cast'}</button>
+        <button type="button" class="btn btn-sm btn-secondary vos-bus-pair-btn">Pair Wi-Fi Cast</button>
+      </div>
+      ${scanStatusLine}
+      <div style="display:flex;flex-direction:column;gap:4px;margin-top:4px;">
+        ${devRows}
+      </div>
+    `;
+  }
+
+  function bindCastBusQuickEvents(container) {
+    if (!container) return;
+    const autoBtn = container.querySelector('.vos-bus-auto-btn');
+    if (autoBtn) {
+      autoBtn.addEventListener('click', () => {
+        if (callbacks.onControlCast) callbacks.onControlCast('all', { cast_auto_connect: true, wake: true });
+      });
+    }
+    const pairBtn = container.querySelector('.vos-bus-pair-btn');
+    if (pairBtn) {
+      pairBtn.addEventListener('click', () => {
+        if (callbacks.onControlCast) callbacks.onControlCast('sdk', { pair_sdk: true });
+      });
+    }
+    container.querySelectorAll('.vos-bus-cast-btn').forEach((b) => {
+      b.addEventListener('click', () => {
+        if (callbacks.onControlCast) callbacks.onControlCast(b.dataset.id, { cast_stream: b.dataset.stream });
+      });
+    });
+    container.querySelectorAll('.vos-bus-open-btn').forEach((b) => {
+      b.addEventListener('click', () => {
+        const sO = findSliceByKey(`o:${b.dataset.id}`) || findSliceByKey(`v:${b.dataset.id}`);
+        if (sO) openSliceMenu(sO);
+        else focusDevice(b.dataset.id, true);
+      });
+    });
+  }
+
+  function buildCastDeviceControlsHtml(dev, idPrefix) {
+    const volId = `vos${idPrefix}CastVolRange`;
+    const queryId = `vos${idPrefix}CastQueryInput`;
+    const m = dev.media && (dev.media.mediaSessionId !== undefined || dev.media.title) ? dev.media : null;
+    const mState = m ? String(m.playerState || '').toUpperCase() : '';
+    const mPlaying = mState === 'PLAYING' || mState === 'BUFFERING';
+    const hasActiveAppOrMedia = Boolean(m || dev.appName);
+    return `
+      <div class="vos-insp-row">
+        <span class="vos-insp-hex">${m ? `${escapeHtml(dev.appName || 'CAST')} &bull; ${escapeHtml(mState)}` : (dev.appName ? `${escapeHtml(dev.appName)} OPEN` : (dev.power ? 'CASTING AUDIO/VIDEO' : 'CAST READY'))} &bull; Vol ${dev.brightness ?? 0}%</span>
+      </div>
+      ${m ? `<div class="vos-insp-row"><span class="vos-insp-hex">${escapeHtml(m.title || 'Playing')}${m.artist ? ` — ${escapeHtml(m.artist)}` : ''}</span></div>` : ''}
+      <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:6px;">
+        <button type="button" class="btn btn-sm ${dev.power ? 'btn-danger' : 'btn-primary'} vos-cast-stream-btn" data-cast-stream="${dev.power ? 'stop' : 'start'}">${dev.power ? 'Stop Casting' : 'Cast Audio / Screen'}</button>
+        <button type="button" class="btn btn-sm btn-secondary vos-cast-wake-btn" data-cast-wake="1">Wake / Connect</button>
+        <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="sync_status">Sync</button>
+      </div>
+      <div class="vos-insp-row" style="gap:6px;">
+        <input type="text" id="${queryId}" class="text-input" placeholder="Song, album, artist or YouTube..." style="flex:1;min-width:110px;padding:4px 8px;font-size:0.75rem;" />
+        <button type="button" class="btn btn-sm btn-primary vos-cast-play-query-btn">Play</button>
+      </div>
+      <div class="vos-insp-row">
+        <label class="vos-insp-lbl">Vol <input type="range" id="${volId}" min="0" max="100" value="${dev.brightness ?? 50}" /></label>
+      </div>
+      <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:5px;">
+        ${hasActiveAppOrMedia ? `
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="previous">Prev</button>
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="rewind" data-seconds="10">-10s</button>
+          <button type="button" class="btn btn-sm btn-primary vos-cast-media-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="fast_forward" data-seconds="10">+10s</button>
+          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="next">Next</button>
+          <button type="button" class="btn btn-sm btn-danger vos-cast-media-btn" data-action="stop_media">Stop</button>
+        ` : ''}
+        <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="play_preset" data-preset="country_night">Country Night</button>
+        <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="play_preset" data-preset="rain">Rain</button>
+      </div>
+    `;
+  }
+
+  function bindCastDeviceControls(container, dev, idPrefix) {
+    if (!container || !dev) return;
+    const volR = container.querySelector(`#vos${idPrefix}CastVolRange`);
+    if (volR) {
+      volR.addEventListener('change', () => triggerDeviceControl(dev, { volume: Number(volR.value) }));
+    }
+    const streamBtn = container.querySelector('.vos-cast-stream-btn');
+    if (streamBtn) {
+      streamBtn.addEventListener('click', () => triggerDeviceControl(dev, { cast_stream: streamBtn.dataset.castStream }));
+    }
+    const wakeBtn = container.querySelector('.vos-cast-wake-btn');
+    if (wakeBtn) {
+      wakeBtn.addEventListener('click', () => triggerDeviceControl(dev, { cast_auto_connect: true, wake: true }));
+    }
+    const queryInp = container.querySelector(`#vos${idPrefix}CastQueryInput`);
+    const playQueryBtn = container.querySelector('.vos-cast-play-query-btn');
+    const submitQuery = () => {
+      const q = queryInp ? queryInp.value.trim() : '';
+      if (!q) return;
+      triggerDeviceControl(dev, { media_action: 'play_web_media', query: q });
+    };
+    if (playQueryBtn) {
+      playQueryBtn.addEventListener('click', submitQuery);
+    }
+    if (queryInp) {
+      queryInp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          submitQuery();
+        }
+      });
+    }
+    container.querySelectorAll('.vos-cast-media-btn').forEach((b) => {
+      b.addEventListener('click', () => triggerDeviceControl(dev, {
+        media_action: b.dataset.action,
+        seconds: b.dataset.seconds ? Number(b.dataset.seconds) : null,
+        preset: b.dataset.preset || undefined
+      }));
+    });
+  }
+
   function openSliceMenu(sliceOrKey) {
     const slice = typeof sliceOrKey === 'string' ? findSliceByKey(sliceOrKey) : sliceOrKey;
     if (!slice || !els.sliceMenu) return;
@@ -5501,6 +5654,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     renderSliceMenu();
     els.sliceMenu.classList.remove('hidden');
     positionSliceMenu(slice);
+    if (slice.dev && slice.dev._kind === 'cast' && callbacks.onControlCast) {
+      callbacks.onControlCast(slice.dev.id, { media_action: 'sync_status', silent: true });
+    }
   }
 
   async function executeSceneFromUi(scene, btnEl, badgeSelector = '.vos-sm-scene-run') {
@@ -5640,7 +5796,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       els.smControls
       && document.activeElement
       && els.smControls.contains(document.activeElement)
-      && document.activeElement.id === 'vosSmBriRange'
+      && ['vosSmBriRange', 'vosSmCastVolRange', 'vosSmCastQueryInput'].includes(document.activeElement.id)
     );
 
     if (els.smControls && !editingCtrl) {
@@ -5659,7 +5815,11 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
           <div class="vos-insp-sys-last" style="margin:0;">
             ${escapeHtml(sys.detailMetric || sys.subtitle || 'Standby')}
           </div>
+          ${slice.sysKey === 'cast' ? buildCastBusQuickHtml() : ''}
         `;
+        if (slice.sysKey === 'cast') {
+          bindCastBusQuickEvents(els.smControls);
+        }
       } else {
         const isLight = dev.category === 'light' || dev.category === 'ble_light';
         const isIr = String(dev.category || '').startsWith('ir_');
@@ -5710,39 +5870,8 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
             b.addEventListener('click', () => triggerDeviceControl(dev, { vacuum_action: b.dataset.vac }));
           });
         } else if (dev._kind === 'cast') {
-          const m = dev.media && (dev.media.mediaSessionId !== undefined || dev.media.title) ? dev.media : null;
-          const mState = m ? String(m.playerState || '').toUpperCase() : '';
-          const mPlaying = mState === 'PLAYING' || mState === 'BUFFERING';
-          els.smControls.innerHTML = `
-            <div class="vos-insp-row">
-              <span class="vos-insp-hex">${m ? `${escapeHtml(dev.appName || 'CAST')} • ${escapeHtml(mState)}` : (dev.appName ? `${escapeHtml(dev.appName)} OPEN` : 'CAST READY')} &bull; Vol ${dev.brightness ?? 0}%</span>
-            </div>
-            ${m ? `<div class="vos-insp-row"><span class="vos-insp-hex">${escapeHtml(m.title || 'Playing')}${m.artist ? ` — ${escapeHtml(m.artist)}` : ''}</span></div>` : ''}
-            <div class="vos-insp-row">
-              <label class="vos-insp-lbl">Volume <input type="range" id="vosSmCastVolRange" min="0" max="100" value="${dev.brightness ?? 50}" /></label>
-            </div>
-            <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:6px;">
-              ${m ? `
-                <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="previous">Prev</button>
-                <button type="button" class="btn btn-sm btn-primary vos-sm-cast-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
-                <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="next">Next</button>
-                <button type="button" class="btn btn-sm btn-danger vos-sm-cast-btn" data-action="stop_media">Stop</button>
-              ` : ''}
-              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="play_preset" data-preset="country_night">Country Night</button>
-              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="play_preset" data-preset="rain">Rain</button>
-              <button type="button" class="btn btn-sm btn-secondary vos-sm-cast-btn" data-action="sync_status">Sync</button>
-            </div>
-          `;
-          const volR = el('vosSmCastVolRange');
-          if (volR) {
-            volR.addEventListener('change', () => triggerDeviceControl(dev, { volume: Number(volR.value) }));
-          }
-          els.smControls.querySelectorAll('.vos-sm-cast-btn').forEach((b) => {
-            b.addEventListener('click', () => triggerDeviceControl(dev, {
-              media_action: b.dataset.action,
-              preset: b.dataset.preset || undefined
-            }));
-          });
+          els.smControls.innerHTML = buildCastDeviceControlsHtml(dev, 'Sm');
+          bindCastDeviceControls(els.smControls, dev, 'Sm');
         } else {
           els.smControls.innerHTML = '';
         }
@@ -5784,7 +5913,10 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
   function renderInspector() {
     if (!els.inspectorBody) return;
-    if (els.inspectorBody.querySelector('.vos-insp-scene-btn.is-running, .vos-insp-scene-btn.is-done')) {
+    if (
+      els.inspectorBody.querySelector('.vos-insp-scene-btn.is-running, .vos-insp-scene-btn.is-done')
+      || (document.activeElement && els.inspectorBody.contains(document.activeElement) && ['vosInspBriRange', 'vosInspCastVolRange', 'vosInspCastQueryInput'].includes(document.activeElement.id))
+    ) {
       return;
     }
 
@@ -5817,12 +5949,16 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
             </div>
             <div class="vos-insp-sys-detail" data-f="detail">${escapeHtml(sys.detailMetric)}</div>
             <div class="vos-insp-sys-last">Last: <span data-f="last">${escapeHtml(sys.lastAction || 'No events recorded yet')}</span></div>
+            ${sys.sysKey === 'cast' ? buildCastBusQuickHtml() : ''}
             <div class="vos-insp-row">
               <button type="button" class="btn btn-sm btn-secondary" id="vosInspBackDevBtn">&larr; Device View</button>
               <button type="button" class="btn btn-sm btn-secondary" id="vosInspResetSysBtn">Reset Usage</button>
             </div>
           </div>
         `;
+        if (sys.sysKey === 'cast') {
+          bindCastBusQuickEvents(els.inspectorBody);
+        }
         const backBtn = el('vosInspBackDevBtn');
         if (backBtn) {
           backBtn.addEventListener('click', () => {
@@ -5855,7 +5991,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     const normC = rgbNormFromDev(dev);
     const orbCss = rgbCss(normC, 1);
     const cat = categoryLabel(dev);
-    const proto = dev.ip ? 'Local LAN' : (dev.platform === 'tuya' ? 'Tuya Cloud' : (dev._kind === 'cast' ? 'Google Cast' : 'BLE'));
+    const proto = dev.discoverySource === 'browser_lan'
+      ? (dev.ssid ? `Wi-Fi LAN • ${dev.ssid}` : 'Wi-Fi LAN')
+      : (dev.ip ? 'Local LAN' : (dev.platform === 'tuya' ? 'Tuya Cloud' : (dev._kind === 'cast' ? 'Google Cast' : 'BLE')));
     const isLight = dev.category === 'light' || dev.category === 'ble_light';
     const isIr = String(dev.category || '').startsWith('ir_');
 
@@ -5910,31 +6048,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
         </div>
       `;
     } else if (dev._kind === 'cast') {
-      const m = dev.media && (dev.media.mediaSessionId !== undefined || dev.media.title) ? dev.media : null;
-      const mState = m ? String(m.playerState || '').toUpperCase() : '';
-      const mPlaying = mState === 'PLAYING' || mState === 'BUFFERING';
-      actionsHtml = `
-        <div class="vos-insp-row">
-          <span class="vos-insp-hex">${m ? `${escapeHtml(dev.appName || 'CAST')} • ${escapeHtml(mState)}` : (dev.appName ? `${escapeHtml(dev.appName)} OPEN` : (dev.power ? 'CASTING AUDIO/VIDEO' : 'CAST READY'))} &bull; Volume ${dev.brightness}%</span>
-        </div>
-        ${m ? `<div class="vos-insp-row"><span class="vos-insp-hex">${escapeHtml(m.title || 'Playing')}${m.artist ? ` — ${escapeHtml(m.artist)}` : ''}</span></div>` : ''}
-        <div class="vos-insp-row">
-          <label class="vos-insp-lbl">Vol <input type="range" id="vosInspCastVolRange" min="0" max="100" value="${dev.brightness ?? 50}" /></label>
-        </div>
-        <div class="vos-insp-row" style="justify-content:flex-start;flex-wrap:wrap;gap:5px;">
-          ${m ? `
-            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="previous">Prev</button>
-            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="rewind" data-seconds="10">-10s</button>
-            <button type="button" class="btn btn-sm btn-primary vos-cast-media-btn" data-action="${mPlaying ? 'pause' : 'play'}">${mPlaying ? 'Pause' : 'Play'}</button>
-            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="fast_forward" data-seconds="10">+10s</button>
-            <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="next">Next</button>
-            <button type="button" class="btn btn-sm btn-danger vos-cast-media-btn" data-action="stop_media">Stop</button>
-          ` : ''}
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="play_preset" data-preset="country_night">Country Night</button>
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="play_preset" data-preset="rain">Rain</button>
-          <button type="button" class="btn btn-sm btn-secondary vos-cast-media-btn" data-action="sync_status">Sync</button>
-        </div>
-      `;
+      actionsHtml = buildCastDeviceControlsHtml(dev, 'Insp');
     }
 
     els.inspectorBody.innerHTML = `
@@ -5976,15 +6090,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     }
     const dockBtn = el('vosInspDockBtn');
     if (dockBtn) dockBtn.addEventListener('click', () => triggerDeviceControl(dev, { vacuum_action: 'dock' }));
-    const castVolEl = el('vosInspCastVolRange');
-    if (castVolEl) castVolEl.addEventListener('change', () => triggerDeviceControl(dev, { volume: Number(castVolEl.value) }));
-    els.inspectorBody.querySelectorAll('.vos-cast-media-btn').forEach((b) => {
-      b.addEventListener('click', () => triggerDeviceControl(dev, {
-        media_action: b.dataset.action,
-        seconds: b.dataset.seconds ? Number(b.dataset.seconds) : null,
-        preset: b.dataset.preset || undefined
-      }));
-    });
+    if (dev._kind === 'cast') {
+      bindCastDeviceControls(els.inspectorBody, dev, 'Insp');
+    }
   }
 
   function renderLogs() {
@@ -6475,6 +6583,16 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
       state.castSdk = {
         active: Boolean(patch.castSdk.active),
         device: String(patch.castSdk.device || '')
+      };
+    }
+    if (patch.castScanState && typeof patch.castScanState === 'object') {
+      state.castScanState = {
+        active: Boolean(patch.castScanState.active),
+        foundCount: Number(patch.castScanState.foundCount || 0),
+        subnet: String(patch.castScanState.subnet || ''),
+        ssid: String(patch.castScanState.ssid || ''),
+        permission: String(patch.castScanState.permission || 'unknown'),
+        message: String(patch.castScanState.message || '')
       };
     }
     if ('ambientSyncActive' in patch) {

@@ -644,6 +644,35 @@ class SmartController
         }
     }
 
+    private static function alignSelectedLanIpWithDevices(StreamStore $store, array $devices): void
+    {
+        $prefix = '';
+        foreach ($devices as $dev) {
+            $host = trim((string)($dev['host'] ?? ''));
+            if ($host !== '' && filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $parts = explode('.', $host);
+                if (count($parts) === 4) {
+                    $prefix = "{$parts[0]}.{$parts[1]}.{$parts[2]}.";
+                    break;
+                }
+            }
+        }
+        if ($prefix === '') {
+            return;
+        }
+        $currentIp = trim((string)($store->getSettings()['selectedLanIp'] ?? ''));
+        if ($currentIp !== '' && str_starts_with($currentIp, $prefix)) {
+            return;
+        }
+        foreach (NetworkHelper::getLanIps() as $iface) {
+            $addr = (string)($iface['address'] ?? '');
+            if ($addr !== '' && str_starts_with($addr, $prefix)) {
+                $store->saveSettings(['selectedLanIp' => $addr]);
+                return;
+            }
+        }
+    }
+
     public static function ensureCastDevicesDiscovered(StreamStore $store, float $timeoutSec = 1.2): array
     {
         $devices = $store->getDevices();
@@ -663,8 +692,11 @@ class SmartController
         $settings = $store->getSettings();
         $bindIp = $settings['selectedLanIp'] ?? '';
         $found = CastMdns::discover($bindIp, $timeoutSec);
+        if (!empty($found)) {
+            self::alignSelectedLanIpWithDevices($store, $found);
+        }
         if (!empty($found) || !empty($devices)) {
-            return $store->mergeDiscoveredDevices($found, true);
+            return $store->mergeDiscoveredDevices($found, !empty($found));
         }
         return $devices;
     }
@@ -705,16 +737,104 @@ class SmartController
             $settings = $store->getSettings();
             $bindIp = $settings['selectedLanIp'] ?? '';
             $found = CastMdns::discover($bindIp, 1.1);
+            if (!empty($found)) {
+                self::alignSelectedLanIpWithDevices($store, $found);
+            }
             $store->mergeDiscoveredDevices($found, true);
         }
-        $activeList = [];
-        foreach ($store->getDevices() as $d) {
-            if (empty($d['isManual']) && empty($d['isSdkOnly']) && array_key_exists('online', $d) && !$d['online']) {
-                continue;
+        return array_values($store->getDevices());
+    }
+
+    public static function autoConnectCastDevices(StreamStore $store, bool $wakeIdle = false): array
+    {
+        $store->exitMobileDataForCurrentNetwork();
+        if (NetworkHelper::isLocalEnvironment()) {
+            $settings = $store->getSettings();
+            $bindIp = $settings['selectedLanIp'] ?? '';
+            $found = CastMdns::discover($bindIp, 1.5);
+            if (!empty($found)) {
+                self::alignSelectedLanIpWithDevices($store, $found);
             }
-            $activeList[] = $d;
+            $store->mergeDiscoveredDevices($found, false);
+
+            $foundIds = [];
+            foreach ($found as $f) {
+                if (!empty($f['id'])) {
+                    $foundIds[(string)$f['id']] = true;
+                }
+            }
+
+            foreach ($store->getDevices() as $id => $dev) {
+                $host = trim((string)($dev['host'] ?? ''));
+                if ($host === '' || !filter_var($host, FILTER_VALIDATE_IP) || !empty($dev['isSdkOnly'])) {
+                    continue;
+                }
+                if (!NetworkHelper::isHostOnCurrentLan($host)) {
+                    $store->removeDevice((string)$id);
+                    continue;
+                }
+                $cast = new CastV2();
+                try {
+                    $cast->connect($host, (int)($dev['port'] ?? 8009), 2.5);
+                    $mediaState = $cast->getMediaState(null, true);
+                    $updated = self::applyCastMediaStateToStore($store, (string)$id, $dev, $mediaState);
+
+                    $isDisplay = (($updated['kind'] ?? 'speaker') === 'display')
+                        && stripos((string)($updated['name'] ?? ''), 'knowhere') === false
+                        && ($updated['variant'] ?? '') !== 'cast_group';
+                    $prefApp = $isDisplay ? '233637DE' : '2DB7CC49';
+
+                    if ($wakeIdle || empty($updated['mdxScreenId']) || in_array((string)($updated['appId'] ?? ''), ['233637DE', '2DB7CC49'], true)) {
+                        $mdx = $cast->probeOrConnectMdxSession($prefApp, $wakeIdle);
+                        if (!empty($mdx['mdxScreenId']) || !empty($mdx['appId'])) {
+                            $mdxPatch = [];
+                            if (!empty($mdx['mdxScreenId'])) {
+                                $mdxPatch['mdxScreenId'] = $mdx['mdxScreenId'];
+                            }
+                            if (!empty($mdx['mdxTheme'])) {
+                                $mdxPatch['mdxTheme'] = $mdx['mdxTheme'];
+                            }
+                            if (!empty($mdx['mdxAppId'])) {
+                                $mdxPatch['mdxAppId'] = $mdx['mdxAppId'];
+                            }
+                            if ($wakeIdle && ($updated['status'] ?? 'IDLE') === 'IDLE' && !empty($mdx['appId'])) {
+                                $mdxPatch['status'] = 'ACTIVE';
+                                $mdxPatch['appId'] = $mdx['appId'];
+                                $mdxPatch['appName'] = $mdx['appName'];
+                            }
+                            if (!empty($mdxPatch)) {
+                                $store->updateDevice((string)$id, $mdxPatch);
+                            }
+                        }
+                    }
+                    $cast->close();
+                } catch (Throwable $ex) {
+                    $cast->close();
+                    if (empty($dev['isManual']) && !isset($foundIds[(string)$id])) {
+                        $store->removeDevice((string)$id);
+                    }
+                }
+            }
+            return array_values($store->getDevices());
         }
-        return $activeList;
+
+        foreach ($store->getDevices() as $id => $dev) {
+            if (!empty($dev['mdxScreenId'])) {
+                $lounge = CastV2::controlYouTubeLoungeCloud(
+                    (string)$dev['mdxScreenId'],
+                    (string)($dev['mdxTheme'] ?? 'cl'),
+                    'get_now_playing'
+                );
+                if (!empty($lounge['hasScreen'])) {
+                    $store->updateDevice((string)$id, [
+                        'online' => true,
+                        'status' => (($dev['status'] ?? 'IDLE') === 'IDLE' ? 'ACTIVE' : $dev['status']),
+                        'mediaSyncAt' => time()
+                    ]);
+                }
+            }
+        }
+        return array_values($store->getDevices());
     }
 
     private static function resolveCastTarget(StreamStore $store, string $deviceIdOrName, string $actionNorm = ''): ?array
