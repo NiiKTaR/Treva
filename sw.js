@@ -1,11 +1,11 @@
-const CACHE_NAME = 'treva-app-shell-v12';
+const CACHE_NAME = 'treva-app-shell-v13';
 const PRECACHE_URLS = [
   './',
   './manifest.webmanifest',
   './assets/icons/icon-192.png',
   './assets/icons/icon-512.png',
   './assets/icons/apple-touch-icon.png',
-  './assets/css/styles.css?v=6.18'
+  './assets/css/styles.css?v=6.19'
 ];
 
 self.addEventListener('install', (event) => {

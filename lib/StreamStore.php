@@ -72,11 +72,21 @@ class StreamStore
     public function initSession(bool $readOnly = false): void
     {
         if (session_status() === PHP_SESSION_NONE && !headers_sent()) {
+            $lifetime = 60 * 60 * 24 * 30; // Persist PHP session cookie for 30 days across Windows Chrome App restarts
+            $isHttps =
+                (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
+                strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https' ||
+                strtolower((string)($_SERVER['HTTP_X_FORWARDED_SSL'] ?? '')) === 'on' ||
+                (!empty($_SERVER['HTTP_CF_VISITOR']) && str_contains((string)$_SERVER['HTTP_CF_VISITOR'], '"https"')) ||
+                (int)($_SERVER['SERVER_PORT'] ?? 80) === 443;
             @ini_set('session.use_only_cookies', '1');
             @ini_set('session.use_strict_mode', '1');
+            @ini_set('session.gc_maxlifetime', (string)$lifetime);
+            @ini_set('session.cookie_lifetime', (string)$lifetime);
             @session_set_cookie_params([
-                'lifetime' => 0,
+                'lifetime' => $lifetime,
                 'path' => '/',
+                'secure' => $isHttps,
                 'httponly' => true,
                 'samesite' => 'Lax'
             ]);
@@ -114,14 +124,18 @@ class StreamStore
     {
         $v = $this->readVault();
         $cfg = $v['smartConfig'] ?? [];
+        // Never treat auto-loaded disk Cast devices ($v['devices']) as vault hydration —
+        // otherwise a fresh session after app restart skips hydrating SmartLife / Magic Home keys.
         return !empty($v['hydrated'])
             || trim((string)($cfg['tuya']['accessId'] ?? '')) !== ''
             || trim((string)($cfg['tuya']['accessSecret'] ?? '')) !== ''
             || trim((string)($cfg['magicHome']['email'] ?? '')) !== ''
+            || trim((string)($cfg['magicHome']['password'] ?? '')) !== ''
             || trim((string)($cfg['magicHome']['token'] ?? '')) !== ''
+            || trim((string)($cfg['googleNest']['projectId'] ?? '')) !== ''
+            || trim((string)($cfg['googleNest']['clientId'] ?? '')) !== ''
             || trim((string)($cfg['openai']['apiKey'] ?? '')) !== ''
             || !empty($v['smartDevices'])
-            || !empty($v['devices'])
             || !empty($v['smartScenes']['scenes']);
     }
 
@@ -147,14 +161,19 @@ class StreamStore
 
     public function hydrateSessionVault(array $incoming): array
     {
+        $cur = $this->readVault();
         $defaults = self::defaultVault();
-        $rawCfg = self::defaultSmartConfigRaw();
+        $rawCfg = $this->readSmartConfigRaw($cur);
         $inCfg = is_array($incoming['smartConfig'] ?? null) ? $incoming['smartConfig'] : [];
         foreach (['tuya', 'magicHome', 'googleNest', 'openai'] as $sec) {
             if (isset($inCfg[$sec]) && is_array($inCfg[$sec])) {
                 foreach ($rawCfg[$sec] as $k => $defVal) {
                     if (array_key_exists($k, $inCfg[$sec])) {
-                        $rawCfg[$sec][$k] = trim((string)$inCfg[$sec][$k]);
+                        $val = trim((string)$inCfg[$sec][$k]);
+                        // Non-destructive hydration: keep existing non-empty session credentials if incoming field is blank
+                        if ($val !== '' || trim((string)($rawCfg[$sec][$k] ?? '')) === '') {
+                            $rawCfg[$sec][$k] = $val;
+                        }
                     }
                 }
             }
@@ -164,35 +183,45 @@ class StreamStore
             $rawCfg['openai']['apiKey'] = '';
         }
 
-        $smartDevices = [];
-        if (isset($incoming['smartDevices']) && is_array($incoming['smartDevices'])) {
+        $smartDevices = is_array($cur['smartDevices'] ?? null) ? $cur['smartDevices'] : [];
+        if (isset($incoming['smartDevices']) && is_array($incoming['smartDevices']) && !empty($incoming['smartDevices'])) {
+            $incomingSmartDevs = [];
             foreach ($incoming['smartDevices'] as $k => $dev) {
                 if (!is_array($dev)) continue;
                 $id = trim((string)($dev['id'] ?? $k));
                 if ($id === '') continue;
                 $dev['id'] = $id;
-                $smartDevices[$id] = $dev;
+                $incomingSmartDevs[$id] = isset($smartDevices[$id]) ? array_merge($smartDevices[$id], $dev) : $dev;
+            }
+            if (!empty($incomingSmartDevs)) {
+                $smartDevices = $incomingSmartDevs;
             }
         }
 
-        $smartScenes = $defaults['smartScenes'];
+        $smartScenes = is_array($cur['smartScenes'] ?? null) ? array_merge($defaults['smartScenes'], $cur['smartScenes']) : $defaults['smartScenes'];
         if (isset($incoming['smartScenes']) && is_array($incoming['smartScenes'])) {
-            $smartScenes = [
-                'homeId' => trim((string)($incoming['smartScenes']['homeId'] ?? '')),
-                'homeName' => trim((string)($incoming['smartScenes']['homeName'] ?? '')),
-                'scenes' => is_array($incoming['smartScenes']['scenes'] ?? null) ? array_values($incoming['smartScenes']['scenes']) : [],
-                'updatedAt' => (int)($incoming['smartScenes']['updatedAt'] ?? 0)
-            ];
+            $inScenesList = is_array($incoming['smartScenes']['scenes'] ?? null) ? array_values($incoming['smartScenes']['scenes']) : [];
+            if (!empty($inScenesList) || empty($smartScenes['scenes'])) {
+                $smartScenes = [
+                    'homeId' => trim((string)($incoming['smartScenes']['homeId'] ?? ($smartScenes['homeId'] ?? ''))),
+                    'homeName' => trim((string)($incoming['smartScenes']['homeName'] ?? ($smartScenes['homeName'] ?? ''))),
+                    'scenes' => $inScenesList,
+                    'updatedAt' => (int)($incoming['smartScenes']['updatedAt'] ?? 0)
+                ];
+            }
         }
 
-        $smartSceneLinks = $defaults['smartSceneLinks'];
+        $smartSceneLinks = is_array($cur['smartSceneLinks'] ?? null) ? array_merge($defaults['smartSceneLinks'], $cur['smartSceneLinks']) : $defaults['smartSceneLinks'];
         if (isset($incoming['smartSceneLinks']) && is_array($incoming['smartSceneLinks'])) {
             $inLinks = $incoming['smartSceneLinks'];
+            $inCustom = is_array($inLinks['customBySceneId'] ?? null) ? $inLinks['customBySceneId'] : [];
+            $inSlices = is_array($inLinks['sliceScenes'] ?? null) ? $inLinks['sliceScenes'] : [];
+            $inCatalog = is_array($inLinks['catalog'] ?? null) ? $inLinks['catalog'] : [];
             $smartSceneLinks = [
-                'updatedAt' => (int)($inLinks['updatedAt'] ?? 0),
-                'customBySceneId' => is_array($inLinks['customBySceneId'] ?? null) ? $inLinks['customBySceneId'] : [],
-                'sliceScenes' => is_array($inLinks['sliceScenes'] ?? null) ? $inLinks['sliceScenes'] : [],
-                'catalog' => is_array($inLinks['catalog'] ?? null) ? $inLinks['catalog'] : []
+                'updatedAt' => (int)($inLinks['updatedAt'] ?? ($smartSceneLinks['updatedAt'] ?? 0)),
+                'customBySceneId' => !empty($inCustom) ? $inCustom : ($smartSceneLinks['customBySceneId'] ?? []),
+                'sliceScenes' => !empty($inSlices) ? $inSlices : ($smartSceneLinks['sliceScenes'] ?? []),
+                'catalog' => !empty($inCatalog) ? $inCatalog : ($smartSceneLinks['catalog'] ?? [])
             ];
         }
 
@@ -699,7 +728,7 @@ class StreamStore
         return [];
     }
 
-    private function commitDevicesState(array $v, array $devicesById, ?string $networkId = null, bool $markHydrated = true): array
+    private function commitDevicesState(array $v, array $devicesById, ?string $networkId = null, bool $markHydrated = false): array
     {
         $devicesById = self::deduplicateCastDevicesMap($devicesById);
         $resolvedNetId = $networkId !== null
@@ -809,7 +838,7 @@ class StreamStore
 
     public function saveDevices(array $devicesById): array
     {
-        return $this->commitDevicesState($this->readVault(), $devicesById, null, true);
+        return $this->commitDevicesState($this->readVault(), $devicesById, null, false);
     }
 
     public function flushCastDevices(?string $networkId = null): array
@@ -817,7 +846,6 @@ class StreamStore
         $v = $this->readVault();
         $v['devices'] = [];
         $v['networkId'] = $networkId ?? (class_exists('NetworkHelper') ? NetworkHelper::getClientNetworkId() : '');
-        $v['hydrated'] = true;
         $this->writeVault($v);
         if (!class_exists('NetworkHelper') || NetworkHelper::isLocalEnvironment()) {
             $this->writeDiskCastDevices([]);
@@ -921,7 +949,7 @@ class StreamStore
             $existing[$id] = $merged;
         }
 
-        return $this->commitDevicesState($v, $existing, $currentNetId !== '' ? $currentNetId : null, true);
+        return $this->commitDevicesState($v, $existing, $currentNetId !== '' ? $currentNetId : null, false);
     }
 
     public function updateDevice(string $id, array $patch): ?array
@@ -1024,7 +1052,7 @@ class StreamStore
         }
 
         $devices[$targetId] = $entry;
-        $committed = $this->commitDevicesState($v, $devices, null, true);
+        $committed = $this->commitDevicesState($v, $devices, null, false);
         return $committed[$targetId] ?? (reset($committed) ?: $entry);
     }
 
@@ -1054,7 +1082,7 @@ class StreamStore
             'muted' => false,
             'lastSeen' => time()
         ];
-        $this->commitDevicesState($v, $devices, null, true);
+        $this->commitDevicesState($v, $devices, null, false);
         return $devices[$id];
     }
 

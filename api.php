@@ -222,7 +222,13 @@ try {
 
     if ($action === 'session_hydrate') {
         $body = readJsonBody();
-        $vault = is_array($body['vault'] ?? null) ? $body['vault'] : [];
+        if (isset($body['vault']) && is_array($body['vault'])) {
+            $vault = $body['vault'];
+        } elseif (isset($body['smartConfig']) || isset($body['smartDevices']) || isset($body['devices']) || isset($body['smartScenes'])) {
+            $vault = $body;
+        } else {
+            $vault = [];
+        }
         $store->hydrateSessionVault($vault);
         $snap = buildSceneSnapshot($store);
         echo json_encode(withSessionVault($store, [
@@ -312,6 +318,7 @@ try {
             'lanSubnets' => NetworkHelper::getActiveLanSubnets(),
             'streamStatus' => $store->getStreamStatus($sid),
             'devices' => array_values($store->getDevices()),
+            'smartConfig' => $store->getSmartConfigPublic(),
             'smartDevices' => $store->getSmartDevicesPublic()
         ]);
         exit;

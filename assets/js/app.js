@@ -62,10 +62,101 @@
   const CACHE_MODE_KEY = 'treva_cache_mode_v1';
   const LOCAL_VAULT_KEY = 'treva_local_vault_v1';
   const TAB_VAULT_KEY = 'treva_tab_vault_v1';
+  const VAULT_IDB_NAME = 'treva_vault_db';
+  const VAULT_IDB_STORE = 'vault';
+  const VAULT_IDB_KEY = 'primary';
   let hydratePromise = null;
+  let initialServerInfoLoaded = false;
+  let storagePersistRequested = false;
   let currentNetworkId = '';
   let originNetworkId = '';
   let isMobileDataMode = false;
+
+  function openVaultIdb() {
+    return new Promise((resolve) => {
+      try {
+        if (typeof window.indexedDB === 'undefined') return resolve(null);
+        const req = window.indexedDB.open(VAULT_IDB_NAME, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(VAULT_IDB_STORE)) {
+            db.createObjectStore(VAULT_IDB_STORE);
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
+  async function readVaultFromIdb() {
+    const db = await openVaultIdb();
+    if (!db) return null;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(VAULT_IDB_STORE, 'readonly');
+        const req = tx.objectStore(VAULT_IDB_STORE).get(VAULT_IDB_KEY);
+        req.onsuccess = () => {
+          const val = req.result;
+          if (!val) return resolve(null);
+          if (typeof val === 'string') {
+            try {
+              const parsed = JSON.parse(val);
+              return resolve(parsed && typeof parsed === 'object' ? parsed : null);
+            } catch (_) {
+              return resolve(null);
+            }
+          }
+          resolve(typeof val === 'object' ? val : null);
+        };
+        req.onerror = () => resolve(null);
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
+  async function writeVaultToIdb(serializedOrObj) {
+    const db = await openVaultIdb();
+    if (!db) return;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(VAULT_IDB_STORE, 'readwrite');
+        tx.objectStore(VAULT_IDB_STORE).put(serializedOrObj, VAULT_IDB_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      } catch (_) {
+        resolve();
+      }
+    });
+  }
+
+  async function clearVaultFromIdb() {
+    const db = await openVaultIdb();
+    if (!db) return;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(VAULT_IDB_STORE, 'readwrite');
+        tx.objectStore(VAULT_IDB_STORE).delete(VAULT_IDB_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      } catch (_) {
+        resolve();
+      }
+    });
+  }
+
+  function ensurePersistentBrowserStorage() {
+    if (storagePersistRequested || getLocalCacheMode() === 'session') return;
+    storagePersistRequested = true;
+    try {
+      if (navigator.storage && typeof navigator.storage.persist === 'function') {
+        navigator.storage.persist().catch(() => {});
+      }
+    } catch (_) {}
+  }
 
   function detectMobileDataConnection() {
     const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
@@ -252,16 +343,42 @@
     return deduplicateCastDevicesList(arr);
   }
 
-  function hasMeaningfulVault(v) {
+  function vaultHasSmartCredentials(v) {
     if (!v || typeof v !== 'object') return false;
     const cfg = v.smartConfig || {};
     const t = cfg.tuya || {};
     const m = cfg.magicHome || {};
+    const g = cfg.googleNest || {};
     const o = cfg.openai || {};
-    if (String(t.accessId || '').trim() || String(t.accessSecret || '').trim()) return true;
-    if (String(m.email || '').trim() || String(m.password || '').trim() || String(m.token || '').trim()) return true;
-    if (String(o.apiKey || '').trim()) return true;
-    if (v.smartDevices && (Array.isArray(v.smartDevices) ? v.smartDevices.length > 0 : Object.keys(v.smartDevices).length > 0)) return true;
+    return Boolean(
+      String(t.accessId || '').trim() ||
+      String(t.accessSecret || '').trim() ||
+      String(m.email || '').trim() ||
+      String(m.password || '').trim() ||
+      String(m.token || '').trim() ||
+      String(g.projectId || '').trim() ||
+      String(g.clientId || '').trim() ||
+      String(g.clientSecret || '').trim() ||
+      String(g.refreshToken || '').trim() ||
+      String(o.apiKey || '').trim()
+    );
+  }
+
+  function normalizeSmartDevicesFromVault(raw) {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.filter((d) => d && typeof d === 'object' && d.id);
+    if (typeof raw === 'object') {
+      return Object.entries(raw)
+        .filter(([, d]) => d && typeof d === 'object')
+        .map(([k, d]) => (d.id ? d : { id: k, ...d }));
+    }
+    return [];
+  }
+
+  function hasMeaningfulVault(v) {
+    if (!v || typeof v !== 'object') return false;
+    if (vaultHasSmartCredentials(v)) return true;
+    if (normalizeSmartDevicesFromVault(v.smartDevices).length > 0) return true;
     if (normalizeDevicesList(v.devices).length > 0) return true;
     if (
       v.devicesByNetwork &&
@@ -272,15 +389,201 @@
     return false;
   }
 
-  function writeLocalVault(vault) {
+  function mergeSmartConfigPreservingExisting(prevCfg, nextCfg, allowEmptyOverwrite = false) {
+    const p = (prevCfg && typeof prevCfg === 'object') ? prevCfg : {};
+    const n = (nextCfg && typeof nextCfg === 'object') ? nextCfg : {};
+    if (allowEmptyOverwrite) {
+      return {
+        tuya: { ...(p.tuya || {}), ...(n.tuya || {}) },
+        magicHome: { ...(p.magicHome || {}), ...(n.magicHome || {}) },
+        googleNest: { ...(p.googleNest || {}), ...(n.googleNest || {}) },
+        openai: { ...(p.openai || {}), ...(n.openai || {}) }
+      };
+    }
+    const out = {};
+    ['tuya', 'magicHome', 'googleNest', 'openai'].forEach((sec) => {
+      const ps = (p[sec] && typeof p[sec] === 'object') ? p[sec] : {};
+      const ns = (n[sec] && typeof n[sec] === 'object') ? n[sec] : {};
+      const keys = new Set([...Object.keys(ps), ...Object.keys(ns)]);
+      const mergedSec = {};
+      keys.forEach((k) => {
+        const nVal = ns[k] !== undefined && ns[k] !== null ? String(ns[k]).trim() : '';
+        const pVal = ps[k] !== undefined && ps[k] !== null ? String(ps[k]).trim() : '';
+        mergedSec[k] = nVal !== '' ? ns[k] : (pVal !== '' ? ps[k] : (ns[k] !== undefined ? ns[k] : ''));
+      });
+      out[sec] = mergedSec;
+    });
+    return out;
+  }
+
+  function buildPublicSmartConfigFromVault(vault, fallbackServerCfg = null) {
+    if (!vault || typeof vault !== 'object') return fallbackServerCfg || null;
+    const cfg = vault.smartConfig || {};
+    const t = cfg.tuya || {};
+    const m = cfg.magicHome || {};
+    const g = cfg.googleNest || {};
+    const o = cfg.openai || {};
+    const fb = (fallbackServerCfg && typeof fallbackServerCfg === 'object') ? fallbackServerCfg : {};
+    const fbOai = fb.openai || {};
+    const tuyaId = String(t.accessId || '').trim();
+    const tuyaSec = String(t.accessSecret || '').trim();
+    const mhEmail = String(m.email || '').trim();
+    const mhPass = String(m.password || '').trim();
+    const mhTok = String(m.token || '').trim();
+    const gProj = String(g.projectId || '').trim();
+    const gCid = String(g.clientId || '').trim();
+    const gCsec = String(g.clientSecret || '').trim();
+    const gRef = String(g.refreshToken || '').trim();
+    const oKey = String(o.apiKey || '').trim();
+    const hasServerKey = Boolean(fbOai.hasServerKey);
+    return {
+      tuya: {
+        configured: Boolean((tuyaId && tuyaSec) || (fb.tuya && fb.tuya.configured)),
+        accessId: tuyaId || (fb.tuya && fb.tuya.accessId) || '',
+        hasSecret: Boolean(tuyaSec || (fb.tuya && fb.tuya.hasSecret)),
+        region: String(t.region || (fb.tuya && fb.tuya.region) || 'us'),
+        uid: String(t.uid || (fb.tuya && fb.tuya.uid) || ''),
+        sampleDeviceId: String(t.sampleDeviceId || (fb.tuya && fb.tuya.sampleDeviceId) || '')
+      },
+      magicHome: {
+        configured: Boolean(mhTok || (mhEmail && mhPass) || (fb.magicHome && fb.magicHome.configured)),
+        email: mhEmail || (fb.magicHome && fb.magicHome.email) || '',
+        hasPassword: Boolean(mhPass || (fb.magicHome && fb.magicHome.hasPassword)),
+        hasToken: Boolean(mhTok || (fb.magicHome && fb.magicHome.hasToken)),
+        region: String(m.region || (fb.magicHome && fb.magicHome.region) || 'us')
+      },
+      googleNest: {
+        configured: Boolean((gProj && gCid) || (fb.googleNest && fb.googleNest.configured)),
+        projectId: gProj || (fb.googleNest && fb.googleNest.projectId) || '',
+        clientId: gCid || (fb.googleNest && fb.googleNest.clientId) || '',
+        hasClientSecret: Boolean(gCsec || (fb.googleNest && fb.googleNest.hasClientSecret)),
+        hasRefreshToken: Boolean(gRef || (fb.googleNest && fb.googleNest.hasRefreshToken))
+      },
+      openai: {
+        configured: Boolean(oKey || hasServerKey || fbOai.configured),
+        hasKey: Boolean(oKey || hasServerKey || fbOai.hasKey),
+        hasSessionKey: Boolean(oKey || fbOai.hasSessionKey),
+        hasServerKey,
+        source: oKey ? 'session' : (hasServerKey ? 'server' : (fbOai.source || 'none')),
+        model: String(o.model || fbOai.model || 'gpt-realtime-mini'),
+        voice: String(o.voice || fbOai.voice || 'verse'),
+        chatModel: String(o.chatModel || fbOai.chatModel || 'gpt-6-luna'),
+        reasoningEffort: String(o.reasoningEffort || fbOai.reasoningEffort || 'low')
+      }
+    };
+  }
+
+  function serverNeedsHydrationFromVault(serverPayload, vault) {
+    if (!hasMeaningfulVault(vault)) return false;
+    if (!serverPayload || serverPayload.sessionHydrated === false) return true;
+    const vCfg = vault.smartConfig || {};
+    const sCfg = serverPayload.smartConfig || {};
+
+    const vTuya = vCfg.tuya || {};
+    const hasLocalTuya = Boolean(String(vTuya.accessId || '').trim() || String(vTuya.accessSecret || '').trim());
+    if (hasLocalTuya && !(sCfg.tuya && (sCfg.tuya.configured || sCfg.tuya.accessId || sCfg.tuya.hasSecret))) {
+      return true;
+    }
+
+    const vMh = vCfg.magicHome || {};
+    const hasLocalMh = Boolean(String(vMh.email || '').trim() || String(vMh.password || '').trim() || String(vMh.token || '').trim());
+    if (hasLocalMh && !(sCfg.magicHome && (sCfg.magicHome.configured || sCfg.magicHome.email || sCfg.magicHome.hasPassword || sCfg.magicHome.hasToken))) {
+      return true;
+    }
+
+    const vNest = vCfg.googleNest || {};
+    const hasLocalNest = Boolean(String(vNest.projectId || '').trim() || String(vNest.clientId || '').trim());
+    if (hasLocalNest && !(sCfg.googleNest && sCfg.googleNest.configured)) {
+      return true;
+    }
+
+    const vOai = vCfg.openai || {};
+    if (String(vOai.apiKey || '').trim() && !(sCfg.openai && sCfg.openai.hasSessionKey)) {
+      return true;
+    }
+
+    const localSmartDevs = normalizeSmartDevicesFromVault(vault.smartDevices);
+    const serverSmartDevs = Array.isArray(serverPayload.smartDevices) ? serverPayload.smartDevices : [];
+    if (localSmartDevs.length > 0 && serverSmartDevs.length === 0) {
+      return true;
+    }
+
+    const localScenes = (vault.smartScenes && Array.isArray(vault.smartScenes.scenes)) ? vault.smartScenes.scenes : [];
+    const serverScenes = (serverPayload.smartScenes && Array.isArray(serverPayload.smartScenes.scenes)) ? serverPayload.smartScenes.scenes : [];
+    if (localScenes.length > 0 && serverPayload.smartScenes !== undefined && serverScenes.length === 0) {
+      return true;
+    }
+
+    return false;
+  }
+
+  async function restoreLocalVaultFromIdbIfNeeded() {
+    if (getLocalCacheMode() === 'session') return readLocalVault();
+    const lsVault = readLocalVault();
+    if (lsVault && vaultHasSmartCredentials(lsVault)) {
+      return lsVault;
+    }
+    const idbVault = await readVaultFromIdb();
+    if (!idbVault || !hasMeaningfulVault(idbVault)) {
+      return lsVault;
+    }
+    const merged = lsVault
+      ? {
+          ...idbVault,
+          ...lsVault,
+          smartConfig: mergeSmartConfigPreservingExisting(idbVault.smartConfig, lsVault.smartConfig, false),
+          smartDevices: normalizeSmartDevicesFromVault(lsVault.smartDevices).length > 0
+            ? lsVault.smartDevices
+            : idbVault.smartDevices,
+          smartScenes: (lsVault.smartScenes && Array.isArray(lsVault.smartScenes.scenes) && lsVault.smartScenes.scenes.length > 0)
+            ? lsVault.smartScenes
+            : idbVault.smartScenes,
+          smartSceneLinks: (lsVault.smartSceneLinks && (
+            Object.keys(lsVault.smartSceneLinks.sliceScenes || {}).length > 0 ||
+            Object.keys(lsVault.smartSceneLinks.customBySceneId || {}).length > 0
+          )) ? lsVault.smartSceneLinks : idbVault.smartSceneLinks
+        }
+      : idbVault;
+    try {
+      if (window.localStorage) window.localStorage.setItem(LOCAL_VAULT_KEY, JSON.stringify(merged));
+    } catch (_) {}
+    return merged;
+  }
+
+  function writeLocalVault(vault, opts = {}) {
     if (!vault || typeof vault !== 'object') return;
     const mode = getLocalCacheMode();
+    const allowEmptyOverwrite = Boolean(opts && opts.allowEmptyOverwrite);
     try {
       const prev = readLocalVault() || {};
       const byNet = (prev.devicesByNetwork && typeof prev.devicesByNetwork === 'object')
         ? { ...prev.devicesByNetwork }
         : {};
-      const vaultToSave = { ...vault };
+      const vaultToSave = { ...prev, ...vault };
+
+      // Protect saved SmartLife Keys & Magic Home credentials from ever being erased by an unhydrated server response
+      vaultToSave.smartConfig = mergeSmartConfigPreservingExisting(prev.smartConfig, vault.smartConfig, allowEmptyOverwrite);
+
+      if (!allowEmptyOverwrite) {
+        const nextSmartDevs = normalizeSmartDevicesFromVault(vault.smartDevices);
+        const prevSmartDevs = normalizeSmartDevicesFromVault(prev.smartDevices);
+        if (nextSmartDevs.length === 0 && prevSmartDevs.length > 0) {
+          vaultToSave.smartDevices = prev.smartDevices;
+        }
+        const nextScenes = (vault.smartScenes && Array.isArray(vault.smartScenes.scenes)) ? vault.smartScenes.scenes : [];
+        const prevScenes = (prev.smartScenes && Array.isArray(prev.smartScenes.scenes)) ? prev.smartScenes.scenes : [];
+        if (nextScenes.length === 0 && prevScenes.length > 0) {
+          vaultToSave.smartScenes = prev.smartScenes;
+        }
+        const nextLinks = vault.smartSceneLinks || {};
+        const prevLinks = prev.smartSceneLinks || {};
+        const nextHasLinks = Object.keys(nextLinks.sliceScenes || {}).length > 0 || Object.keys(nextLinks.customBySceneId || {}).length > 0;
+        const prevHasLinks = Object.keys(prevLinks.sliceScenes || {}).length > 0 || Object.keys(prevLinks.customBySceneId || {}).length > 0;
+        if (!nextHasLinks && prevHasLinks) {
+          vaultToSave.smartSceneLinks = prev.smartSceneLinks;
+        }
+      }
+
       const netKey = currentNetworkId || vault.networkId || '';
       const normDevices = normalizeDevicesList(vault.devices);
       if (isMobileDataMode) {
@@ -299,9 +602,14 @@
       if (mode === 'session') {
         if (window.sessionStorage) window.sessionStorage.setItem(TAB_VAULT_KEY, serialized);
         if (window.localStorage) window.localStorage.removeItem(LOCAL_VAULT_KEY);
+        clearVaultFromIdb();
       } else {
         if (window.localStorage) window.localStorage.setItem(LOCAL_VAULT_KEY, serialized);
         if (window.sessionStorage) window.sessionStorage.removeItem(TAB_VAULT_KEY);
+        writeVaultToIdb(serialized);
+        if (vaultHasSmartCredentials(vaultToSave)) {
+          ensurePersistentBrowserStorage();
+        }
       }
     } catch (_) {}
   }
@@ -318,6 +626,7 @@
         window.sessionStorage.removeItem(TAB_VAULT_KEY);
         window.sessionStorage.removeItem('treva_vos_slice_scenes_v1');
       }
+      clearVaultFromIdb();
     } catch (_) {}
   }
 
@@ -341,14 +650,15 @@
           window.localStorage.removeItem('treva_vos_slice_scenes_v1');
           window.localStorage.removeItem('treva_vos_sys_usage_v1');
         }
+        clearVaultFromIdb();
       } catch (_) {}
     }
     updateLocalSessionStatusUi();
   }
 
-  function persistSessionVaultFromResponse(data) {
+  function persistSessionVaultFromResponse(data, opts = {}) {
     if (!data || !data.sessionVault || typeof data.sessionVault !== 'object') return;
-    writeLocalVault(data.sessionVault);
+    writeLocalVault(data.sessionVault, opts);
     updateLocalSessionStatusUi();
   }
 
@@ -394,7 +704,8 @@
     };
     hydratePromise = (async () => {
       try {
-        const res = await fetch(apiUrl('session_hydrate'), {
+        const targetUrl = apiUrl('session_hydrate');
+        const res = await fetch(targetUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
@@ -404,7 +715,16 @@
         if (!res.ok || data.error) {
           throw new Error(data.error || 'Session hydration failed');
         }
-        persistSessionVaultFromResponse(data);
+        // When using a desktop local bridge, also hydrate the same-origin remote session so info/state stay in sync
+        if (localLanBridgeBase) {
+          fetch(`api.php?action=session_hydrate&sid=${encodeURIComponent(STREAM_SID)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            cache: 'no-store',
+            body: JSON.stringify({ vault: scopedVault })
+          }).catch(() => {});
+        }
+        persistSessionVaultFromResponse(data, { allowEmptyOverwrite: false });
         return data;
       } catch (err) {
         if (!silent) showToast(err.message || 'Could not restore local session', 'error');
@@ -813,7 +1133,7 @@
               fetch(`${base}api.php?action=session_hydrate&sid=${encodeURIComponent(STREAM_SID)}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(vault)
+                body: JSON.stringify({ vault })
               }).catch(() => {});
             }
           } catch (_) {}
@@ -1585,6 +1905,25 @@
   // ===========================================================================
   async function loadServerInfo(forceBridgeProbe = false) {
     try {
+      const bootVault = await restoreLocalVaultFromIdbIfNeeded();
+      if (bootVault && hasMeaningfulVault(bootVault)) {
+        if (!smartConfig && vaultHasSmartCredentials(bootVault)) {
+          smartConfig = buildPublicSmartConfigFromVault(bootVault, smartConfig);
+          populateSmartConfigForm();
+        }
+        if ((!smartDevices || smartDevices.length === 0) && normalizeSmartDevicesFromVault(bootVault.smartDevices).length > 0) {
+          smartDevices = normalizeSmartDevicesFromVault(bootVault.smartDevices);
+          renderSmartDevices(true);
+        }
+        if ((!smartScenes || !Array.isArray(smartScenes.scenes) || smartScenes.scenes.length === 0) && bootVault.smartScenes && Array.isArray(bootVault.smartScenes.scenes) && bootVault.smartScenes.scenes.length > 0) {
+          smartScenes = bootVault.smartScenes;
+          renderSmartScenes();
+        }
+        if (bootVault.smartSceneLinks && bootVault.smartSceneLinks.sliceScenes && Object.keys(sliceSceneMap || {}).length === 0) {
+          sliceSceneMap = bootVault.smartSceneLinks.sliceScenes;
+        }
+      }
+
       const res = await fetch(apiUrl('info'), { cache: 'no-store' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Server error');
@@ -1656,23 +1995,25 @@
       if (serverNetId) currentNetworkId = serverNetId;
 
       let activePayload = data;
-      if (!data.sessionHydrated) {
-        const localVault = readLocalVault();
-        if (hasMeaningfulVault(localVault)) {
-          const restored = await hydrateServerSession(localVault, true);
-          if (restored && restored.ok) {
-            activePayload = { ...data, ...restored };
-            const origDevs = normalizeDevicesList(data.devices);
-            const restDevs = normalizeDevicesList(restored.devices);
-            if (origDevs.length > 0 && restDevs.length === 0) {
-              activePayload.devices = origDevs;
-            }
+      const preHydrateVault = readLocalVault();
+      if (serverNeedsHydrationFromVault(data, preHydrateVault)) {
+        const restored = await hydrateServerSession(preHydrateVault, true);
+        if (restored && restored.ok) {
+          activePayload = { ...data, ...restored };
+          const origDevs = normalizeDevicesList(data.devices);
+          const restDevs = normalizeDevicesList(restored.devices);
+          if (origDevs.length > 0 && restDevs.length === 0) {
+            activePayload.devices = origDevs;
           }
         }
       }
 
       if (activePayload.smartConfig) {
         smartConfig = activePayload.smartConfig;
+        // If server still lacks credentials that exist in browser vault (e.g. transient error), keep local public view intact
+        if (preHydrateVault && vaultHasSmartCredentials(preHydrateVault)) {
+          smartConfig = buildPublicSmartConfigFromVault(preHydrateVault, smartConfig);
+        }
         populateSmartConfigForm();
       }
       if (Array.isArray(activePayload.sceneLinks)) {
@@ -1686,7 +2027,10 @@
         renderSmartScenes();
       }
       if (Array.isArray(activePayload.smartDevices)) {
-        smartDevices = activePayload.smartDevices;
+        const cachedSmartDevs = preHydrateVault ? normalizeSmartDevicesFromVault(preHydrateVault.smartDevices) : [];
+        smartDevices = (activePayload.smartDevices.length > 0 || cachedSmartDevs.length === 0)
+          ? activePayload.smartDevices
+          : cachedSmartDevs;
         renderSmartDevices(true);
       }
 
@@ -1727,7 +2071,7 @@
       }
     } catch (err) {
       isMobileDataMode = detectMobileDataConnection();
-      const offlineVault = readLocalVault();
+      const offlineVault = await restoreLocalVaultFromIdbIfNeeded();
       if (offlineVault) {
         if (isMobileDataMode) {
           devices = [];
@@ -1740,9 +2084,13 @@
             : [];
           devices = offlineByNet.length > 0 ? offlineByNet : offlineDirect;
         }
-        if (Array.isArray(offlineVault.smartDevices)) smartDevices = offlineVault.smartDevices;
+        const offlineSmartDevs = normalizeSmartDevicesFromVault(offlineVault.smartDevices);
+        if (offlineSmartDevs.length > 0) smartDevices = offlineSmartDevs;
         if (offlineVault.smartScenes) smartScenes = offlineVault.smartScenes;
-        if (offlineVault.smartConfig) smartConfig = offlineVault.smartConfig;
+        if (offlineVault.smartConfig) {
+          smartConfig = buildPublicSmartConfigFromVault(offlineVault, smartConfig);
+          populateSmartConfigForm();
+        }
         renderDevices(true);
         renderSmartDevices(true);
         renderSmartScenes();
@@ -1751,6 +2099,8 @@
       serverStatusText.textContent = navigator.onLine === false ? 'Offline Local Mode' : 'Local Diagnostic Mode';
       runLocalNetworkDiagnostics({ silent: true, showPanel: true });
       console.error('Info error:', err);
+    } finally {
+      initialServerInfoLoaded = true;
     }
   }
 
@@ -2137,7 +2487,7 @@
       }, 7000);
     }
     pollTimer = setInterval(async () => {
-      if (hydratePromise) return;
+      if (!initialServerInfoLoaded || hydratePromise) return;
       try {
         const res = await fetch(apiUrl('state'), { cache: 'no-store' });
         if (!res.ok) return;
@@ -2170,27 +2520,25 @@
           currentNetworkId = srvNet;
         }
 
-        if (castDiscoveryInFlightCount > 0 || browserCastScanPromise) {
-          return;
+        const localVault = readLocalVault();
+        if (serverNeedsHydrationFromVault(data, localVault)) {
+          const restored = await hydrateServerSession(localVault, true);
+          if (restored && restored.ok) {
+            if (restored.smartConfig) {
+              smartConfig = restored.smartConfig;
+              populateSmartConfigForm();
+            }
+            applySyncedScenesData(restored);
+            if (Array.isArray(restored.devices) && castDiscoveryInFlightCount === 0 && !browserCastScanPromise) {
+              devices = normalizeDevicesList(restored.devices);
+              renderDevices(true);
+            }
+            return;
+          }
         }
 
-        if (data.sessionHydrated === false) {
-          const localVault = readLocalVault();
-          if (hasMeaningfulVault(localVault)) {
-            const restored = await hydrateServerSession(localVault, true);
-            if (restored && restored.ok) {
-              if (restored.smartConfig) {
-                smartConfig = restored.smartConfig;
-                populateSmartConfigForm();
-              }
-              applySyncedScenesData(restored);
-              if (Array.isArray(restored.devices)) {
-                devices = normalizeDevicesList(restored.devices);
-                renderDevices(true);
-              }
-              return;
-            }
-          }
+        if (castDiscoveryInFlightCount > 0 || browserCastScanPromise) {
+          return;
         }
 
         if (Date.now() < interactionLockUntil) return;
@@ -2202,9 +2550,12 @@
           changed = true;
         }
         if (Array.isArray(data.smartDevices)) {
-          smartDevices = data.smartDevices;
-          renderSmartDevices(false);
-          changed = true;
+          const cachedSmartDevs = localVault ? normalizeSmartDevicesFromVault(localVault.smartDevices) : [];
+          if (data.smartDevices.length > 0 || cachedSmartDevs.length === 0) {
+            smartDevices = data.smartDevices;
+            renderSmartDevices(false);
+            changed = true;
+          }
         }
         if (changed || data.streamStatus) syncVosState(data.streamStatus || null);
       } catch (_) {
@@ -4934,7 +5285,7 @@
         if (Array.isArray(data.smartDevices)) {
           smartDevices = data.smartDevices;
           renderSmartDevices(true);
-          persistSessionVaultFromResponse(data);
+          persistSessionVaultFromResponse(data, { allowEmptyOverwrite: true });
           syncVosState();
         }
       });
@@ -5200,7 +5551,7 @@
         if (data.smartConfig) {
           smartConfig = data.smartConfig;
         }
-        persistSessionVaultFromResponse(data);
+        persistSessionVaultFromResponse(data, { allowEmptyOverwrite: true });
         if (openAiKeyInput) openAiKeyInput.value = '';
         populateSmartConfigForm();
         showToast('Cleared local OpenAI key (using server fallback if configured).', 'info');
@@ -5244,36 +5595,62 @@
     }
 
     try {
+      const prevVault = readLocalVault() || {};
+      const prevCfg = (prevVault && prevVault.smartConfig) ? prevVault.smartConfig : {};
+      const prevTuya = prevCfg.tuya || {};
+      const prevMh = prevCfg.magicHome || {};
+      const prevOai = prevCfg.openai || {};
+      const prevNest = prevCfg.googleNest || {};
+
+      const resolveSecretInput = (rawVal, savedVal, keepWhenBlank) => {
+        const trimmed = String(rawVal || '').trim();
+        const saved = String(savedVal || '').trim();
+        if (trimmed === SAVED_SECRET_MASK) return saved || SAVED_SECRET_MASK;
+        if (trimmed === '' && keepWhenBlank && saved !== '') return saved;
+        return trimmed;
+      };
+
+      const tuyaIdVal = tuyaAccessIdInput.value.trim();
+      const tuyaSecretVal = resolveSecretInput(tuyaAccessSecretInput.value, prevTuya.accessSecret, tuyaIdVal !== '');
+      const mhEmailVal = mhEmailInput.value.trim();
+      const mhPassRaw = mhPasswordInput.value;
+      const mhPassVal = (String(mhPassRaw || '').trim() === SAVED_SECRET_MASK || (String(mhPassRaw || '').trim() === '' && mhEmailVal !== ''))
+        ? (String(prevMh.password || '') || mhPassRaw)
+        : mhPassRaw;
+      const mhTokVal = resolveSecretInput(mhTokenInput.value, prevMh.token, true);
+
       const savePayload = {
         tuya: {
-          accessId: tuyaAccessIdInput.value.trim(),
-          accessSecret: tuyaAccessSecretInput.value.trim(),
+          accessId: tuyaIdVal,
+          accessSecret: tuyaSecretVal,
           region: tuyaRegionSelect.value,
           uid: uidVal,
           sampleDeviceId: sampleDevVal
         },
         magicHome: {
-          email: mhEmailInput.value.trim(),
-          password: mhPasswordInput.value,
+          email: mhEmailVal,
+          password: mhPassVal,
           region: mhRegionSelect.value
         }
       };
-      if (mhTokenInput.value.trim() !== '') {
-        savePayload.magicHome.token = mhTokenInput.value.trim();
+      if (mhTokVal !== '') {
+        savePayload.magicHome.token = mhTokVal;
       }
       if (openAiKeyInput) {
         savePayload.openai = {
-          apiKey: openAiKeyInput.value.trim(),
+          apiKey: resolveSecretInput(openAiKeyInput.value, prevOai.apiKey, false),
           voice: openAiVoiceModalSelect ? openAiVoiceModalSelect.value : 'verse',
           model: aiModelSelect ? aiModelSelect.value : 'gpt-realtime-mini'
         };
       }
       if (googleNestProjectIdInput || googleNestClientIdInput) {
+        const gProjVal = googleNestProjectIdInput ? googleNestProjectIdInput.value.trim() : '';
+        const gCidVal = googleNestClientIdInput ? googleNestClientIdInput.value.trim() : '';
         savePayload.googleNest = {
-          projectId: googleNestProjectIdInput ? googleNestProjectIdInput.value.trim() : '',
-          clientId: googleNestClientIdInput ? googleNestClientIdInput.value.trim() : '',
-          clientSecret: googleNestClientSecretInput ? googleNestClientSecretInput.value.trim() : '',
-          refreshToken: googleNestRefreshTokenInput ? googleNestRefreshTokenInput.value.trim() : ''
+          projectId: gProjVal,
+          clientId: gCidVal,
+          clientSecret: resolveSecretInput(googleNestClientSecretInput ? googleNestClientSecretInput.value : '', prevNest.clientSecret, gProjVal !== '' || gCidVal !== ''),
+          refreshToken: resolveSecretInput(googleNestRefreshTokenInput ? googleNestRefreshTokenInput.value : '', prevNest.refreshToken, gProjVal !== '' || gCidVal !== '')
         };
       }
 
@@ -5288,7 +5665,15 @@
         smartConfig = saveData.smartConfig;
         populateSmartConfigForm();
       }
-      persistSessionVaultFromResponse(saveData);
+      persistSessionVaultFromResponse(saveData, { allowEmptyOverwrite: true });
+      if (localLanBridgeBase && saveData.sessionVault) {
+        fetch(`api.php?action=session_hydrate&sid=${encodeURIComponent(STREAM_SID)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          body: JSON.stringify({ vault: saveData.sessionVault })
+        }).catch(() => {});
+      }
 
       smartKeysModal.classList.add('hidden');
       const hasSmartCreds = Boolean(
@@ -5402,7 +5787,7 @@
       if (data.sliceScenes && typeof data.sliceScenes === 'object') {
         sliceSceneMap = data.sliceScenes;
       }
-      persistSessionVaultFromResponse(data);
+      persistSessionVaultFromResponse(data, { allowEmptyOverwrite: true });
       syncVosState();
       renderSmartDevices(true);
       showToast('Updated SmartLife slice routines', 'success');
@@ -5488,7 +5873,7 @@
       if (Array.isArray(data.sceneLinks)) {
         smartSceneLinks = data.sceneLinks;
       }
-      persistSessionVaultFromResponse(data);
+      persistSessionVaultFromResponse(data, { allowEmptyOverwrite: true });
       renderSmartScenes();
       showToast('Saved scene voice links!', 'success');
     } catch (err) {

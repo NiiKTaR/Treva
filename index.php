@@ -24,7 +24,7 @@
   <link rel="icon" type="image/png" sizes="512x512" href="assets/icons/icon-512.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="assets/icons/apple-touch-icon.png" />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(30 12 12)'/%3E%3Cellipse cx='12' cy='12' rx='10' ry='4.5' transform='rotate(-30 12 12)'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="assets/css/styles.css?v=6.18" />
+  <link rel="stylesheet" href="assets/css/styles.css?v=6.19" />
   <script type="importmap">
     {
       "imports": {
@@ -906,9 +906,9 @@
   <div class="toast-container" id="toastContainer"></div>
 
   <script src="assets/js/qrcode.js"></script>
-  <script type="module" src="assets/js/vos-3d.js?v=6.18"></script>
-  <script defer src="assets/js/treva-voice-match.js?v=6.18"></script>
-  <script defer src="assets/js/app.js?v=6.18"></script>
-  <script defer src="assets/js/pwa.js?v=6.18"></script>
+  <script type="module" src="assets/js/vos-3d.js?v=6.19"></script>
+  <script defer src="assets/js/treva-voice-match.js?v=6.19"></script>
+  <script defer src="assets/js/app.js?v=6.19"></script>
+  <script defer src="assets/js/pwa.js?v=6.19"></script>
 </body>
 </html>
